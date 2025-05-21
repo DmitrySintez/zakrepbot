@@ -69,11 +69,36 @@ class ChatCacheService:
         try:
             # Fetch fresh data
             chat = await bot.get_chat(chat_id)
-            member_count = await bot.get_chat_member_count(chat_id)
             
+            # Попытка получить количество участников
+            member_count = None
+            try:
+                member_count = await bot.get_chat_member_count(chat_id)
+            except Exception as e:
+                from loguru import logger
+                logger.warning(f"Не удалось получить количество участников для чата {chat_id}: {e}")
+            
+            # Проверяем тип чата и права бота
+            bot_id = (await bot.get_me()).id
+            bot_member = None
+            can_pin = False
+            
+            try:
+                bot_member = await bot.get_chat_member(chat_id, bot_id)
+                if bot_member.status == 'administrator':
+                    can_pin = getattr(bot_member, 'can_pin_messages', False)
+                    
+                    if not can_pin:
+                        from loguru import logger
+                        logger.warning(f"Бот не имеет прав на закрепление сообщений в чате {chat_id}")
+            except Exception as e:
+                from loguru import logger
+                logger.warning(f"Ошибка при проверке прав бота в чате {chat_id}: {e}")
+            
+            # Создаем объект информации о чате
             info = ChatInfo(
                 id=chat_id,
-                title=chat.title,
+                title=chat.title or f"Чат {chat_id}",
                 type=chat.type,
                 member_count=member_count,
                 last_updated=now

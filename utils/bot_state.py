@@ -3,8 +3,9 @@ from typing import Optional
 import asyncio
 from loguru import logger
 from database.repository import Repository
-from datetime import datetime
+from datetime import datetime, timedelta
 from aiogram import types
+from utils.message_utils import find_latest_message as find_msg
 
 class BotState(ABC):
     """Abstract base class for bot states"""
@@ -44,190 +45,188 @@ class IdleState(BotState):
         # Don't forward messages in idle state
         logger.info("Bot is idle, not forwarding messages")
 
-class RunningState(BotState):
-    """State when bot is actively forwarding messages"""
+class IdleState:
+    """Состояние, когда бот не пересылает сообщения"""
     
-    def __init__(self, bot_context, interval: int, auto_forward: bool = False):
+    def __init__(self, bot_context):
         self.context = bot_context
-        self.interval = interval  # Global repost interval
-        self._repost_task: Optional[asyncio.Task] = None
-        self.auto_forward = auto_forward
-        
-        # Initialize tracking for each channel's last post time
-        now = datetime.now().timestamp()
-        self._channel_last_post = {}
-        
-        # Important: Initialize all channels with current time
-        # This forces each channel to wait for the full interval before posting
-        for channel in self.context.config.source_channels:
-            self._channel_last_post[channel] = now
-        
-        # Initialize these attributes to track channel rotation
-        self._last_processed_channel = None
-        self._last_global_post_time = now
-        
-        # Start the repost task
-        self._start_repost_task()
-        
-    def _start_repost_task(self):
-        # Always start the repost task if it's not running, regardless of auto_forward setting
-        if not self._repost_task or self._repost_task.done():
-            self._repost_task = asyncio.create_task(self._fallback_repost())
-
-    async def toggle_auto_forward(self):
-        """Toggle automatic message forwarding"""
-        self.auto_forward = not self.auto_forward
-        logger.info(f"Автопересылка: {self.auto_forward}")
-        
+    
     async def start(self) -> None:
-        # Already running
+        # Получаем интервал из базы (по умолчанию 2 часа = 7200 секунд)
+        interval = int(await Repository.get_config("rotation_interval", "7200"))
+        # Вместо вызова несуществующего метода, создаем объект RunningState
+        # и присваиваем его контексту
+        self.context.state = RunningState(self.context, interval)
+        # Уведомляем админов о запуске
+        await self.context._notify_admins(f"Бот начал ротацию закрепленных сообщений с интервалом {interval//60} минут")
+    
+    async def stop(self) -> None:
+        # Уже остановлен
+        pass
+    
+    async def handle_message(self, channel_id: str, message_id: int) -> None:
+        # Только сохраняем сообщение, но не делаем пересылку в состоянии Idle
+        await Repository.save_last_message(channel_id, message_id)
+        logger.info(f"Сохранено сообщение {message_id} из канала {channel_id} (бот остановлен)")
+        
+class RunningState:
+    """Состояние, когда бот активно пересылает и закрепляет сообщения с ротацией между каналами"""
+    
+    def __init__(self, bot_context, interval: int):
+        self.context = bot_context
+        self.interval = interval  # Интервал ротации в секундах (например, 7200 = 2 часа)
+        self._rotation_task = None
+        
+        # Индекс текущего канала для ротации
+        self._current_channel_index = 0
+        
+        # Запускаем задачу ротации
+        self._start_rotation_task()
+        
+    async def find_latest_message(self, channel_id: str) -> Optional[int]:
+        """Метод-обертка для поиска последнего доступного сообщения в канале"""
+        last_id = await Repository.get_last_message(channel_id)
+        return await find_msg(self.context.bot, channel_id, self.context.config.owner_id, last_id)
+        
+    def _start_rotation_task(self):
+        """Запуск задачи ротации каналов"""
+        if not self._rotation_task or self._rotation_task.done():
+            self._rotation_task = asyncio.create_task(self._channel_rotation())
+            
+    def update_interval(self, new_interval: int):
+        """Обновление интервала ротации"""
+        logger.info(f"Обновление интервала ротации с {self.interval} на {new_interval} секунд")
+        self.interval = new_interval
+        
+        # Перезапускаем задачу с новым интервалом
+        if self._rotation_task and not self._rotation_task.done():
+            logger.info("Отмена существующей задачи ротации")
+            self._rotation_task.cancel()
+        else:
+            logger.info("Предыдущая задача ротации не найдена или уже завершена")
+        
+        logger.info("Запуск новой задачи ротации")
+        self._start_rotation_task()
+    
+    async def start(self) -> None:
+        # Уже запущен
         pass
     
     async def stop(self) -> None:
-        if self._repost_task and not self._repost_task.done():
-            self._repost_task.cancel()
-        self.auto_forward = False
-        self.context.state = IdleState(self.context, self.auto_forward)
-        await self.context._notify_admins("Бот остановил пересылку")
+        if self._rotation_task and not self._rotation_task.done():
+            self._rotation_task.cancel()
+        
+        await self.context._notify_admins("Бот остановил ротацию каналов")
     
     async def handle_message(self, channel_id: str, message_id: int) -> None:
-        if self.auto_forward:
-            await self.context._forward_message(channel_id, message_id)
-            # Update last post time for this channel
-            self._channel_last_post[channel_id] = datetime.now().timestamp()
-        else:
-            logger.info("Автопересылка отключена, пропускаем сообщение")
+        """Обработка нового сообщения из канала"""
+        # Когда в канале появляется новое сообщение, сохраняем его ID
+        await Repository.save_last_message(channel_id, message_id)
+        logger.info(f"Сохранено новое сообщение {message_id} из канала {channel_id}")
     
-    async def _get_next_channel_to_repost(self):
-        """Get the next channel that should be reposted based on intervals"""
-        now = datetime.now().timestamp()
+    async def _channel_rotation(self):
+        """Основная задача ротации закрепленных сообщений по расписанию"""
+        try:
+            logger.info("Запущена задача ротации закрепленных сообщений")
+            
+            # Начинаем с первого канала
+            await self._rotate_to_next_channel()
+            
+            while True:
+                # Ждем указанный интервал до следующей ротации
+                logger.info(f"Ожидание {self.interval} секунд до следующей ротации закрепленных сообщений")
+                await asyncio.sleep(self.interval)
+                
+                # Переключаемся на следующий канал
+                await self._rotate_to_next_channel()
+                
+        except asyncio.CancelledError:
+            logger.info("Задача ротации закрепленных сообщений отменена")
+        except Exception as e:
+            logger.error(f"Ошибка в задаче ротации закрепленных сообщений: {e}")
+            import traceback
+            logger.error(f"Traceback: {traceback.format_exc()}")
+            
+            # Перезапускаем задачу в случае неожиданной ошибки через 10 секунд
+            await asyncio.sleep(10)
+            self._start_rotation_task()
+    
+    async def _rotate_to_next_channel(self) -> bool:
+        """Переключение на следующий канал в ротации и закрепление его сообщения"""
         source_channels = self.context.config.source_channels
         
         if not source_channels:
-            return None
+            logger.warning("Нет настроенных исходных каналов для ротации")
+            return False
         
-        # Use the interval set by the user
-        channel_interval = self.interval
+        # Убедимся, что индекс в пределах списка каналов
+        if self._current_channel_index >= len(source_channels):
+            self._current_channel_index = 0
         
-        # Find the channel that hasn't been posted for the longest time
-        oldest_channel = None
-        oldest_time = now
+        # Получаем текущий канал
+        channel_id = source_channels[self._current_channel_index]
+        logger.info(f"Ротация на канал: {channel_id} (индекс: {self._current_channel_index})")
         
-        for channel in source_channels:
-            last_post_time = self._channel_last_post.get(channel, 0)
+        # Получаем ID последнего сообщения в этом канале
+        message_id = await Repository.get_last_message(channel_id)
+        
+        if not message_id:
+            logger.warning(f"Не найдено последнее сообщение для канала {channel_id}")
             
-            # If this channel hasn't been posted for more than the interval
-            # and is older than our current oldest, select it
-            if now - last_post_time >= channel_interval and last_post_time < oldest_time:
-                oldest_channel = channel
-                oldest_time = last_post_time
-                
-        return oldest_channel
+            # Пытаемся найти последнее сообщение в канале
+            latest_id = await self.find_latest_message(channel_id)
+            if latest_id:
+                message_id = latest_id
+                await Repository.save_last_message(channel_id, latest_id)
+                logger.info(f"Найдено и сохранено новое последнее сообщение: {latest_id}")
+            else:
+                # Если не удалось найти сообщение, переходим к следующему каналу
+                logger.error(f"Не удалось найти ни одного сообщения в канале {channel_id}")
+                self._current_channel_index = (self._current_channel_index + 1) % len(source_channels)
+                return False
         
-    async def _get_channel_pair_interval(self, channel1: str, channel2: str) -> Optional[int]:
-        """Get the interval between two channels (if set)"""
-        try:
-            # Get from database
-            intervals = await Repository.get_channel_intervals()
-            
-            # Check if this pair has a configured interval
-            for pair_key, pair_data in intervals.items():
-                if pair_key == channel1 and pair_data["next_channel"] == channel2:
-                    return pair_data["interval"]
-            
-            return None  # No specific interval set
-        except Exception as e:
-            logger.error(f"Error getting channel pair interval: {e}")
-            return None
+        logger.info(f"Будет переслано и закреплено сообщение: {message_id} из канала: {channel_id}")
         
-    async def _fallback_repost(self):
-        """Periodic repost task with proper interval handling for all channels"""
-        while True:
-            try:
-                await asyncio.sleep(10)
-                
-                now = datetime.now().timestamp()
-                source_channels = self.context.config.source_channels
-                if not source_channels:
-                    logger.warning("Нет настроенных исходных каналов")
-                    continue
-                
-                eligible_channels = []
-                for channel in source_channels:
-                    last_post_time = self._channel_last_post.get(channel, 0)
-                    
-                    if now - last_post_time >= self.interval:
-                        eligible_channels.append(channel)
-                
-                if not eligible_channels:
-                    continue
-                    
-                next_channel = None
-                
-                if self._last_processed_channel is None:
-                    next_channel = eligible_channels[0]
-                    logger.debug(f"Первый запуск, выбран канал {next_channel}")
+        # Пересылаем и закрепляем сообщение во все целевые чаты
+        success = await self.context.forward_and_pin_message(channel_id, message_id)
+        
+        if success:
+            logger.info(f"Успешно переслано и закреплено сообщение из канала {channel_id}")
+            
+            # Подготавливаем следующий канал
+            self._current_channel_index = (self._current_channel_index + 1) % len(source_channels)
+            
+            # Рассчитываем время следующей ротации для логирования
+            next_time = datetime.now() + timedelta(seconds=self.interval)
+            next_time_str = next_time.strftime('%H:%M:%S')
+            
+            # Форматируем интервал для удобства чтения
+            if self.interval >= 3600:
+                hours = self.interval // 3600
+                minutes = (self.interval % 3600) // 60
+                if minutes > 0:
+                    interval_str = f"{hours} ч {minutes} мин"
                 else:
-                    current_idx = -1
-                    try:
-                        current_idx = source_channels.index(self._last_processed_channel)
-                    except ValueError:
-                        pass
-                    
-                    for i in range(1, len(source_channels) + 1):
-                        next_idx = (current_idx + i) % len(source_channels)
-                        candidate = source_channels[next_idx]
-                        
-                        if candidate in eligible_channels:
-                            pair_interval = await self._get_channel_pair_interval(
-                                self._last_processed_channel, candidate
-                            ) or 300
-                            
-                            if now - self._last_global_post_time >= pair_interval:
-                                next_channel = candidate
-                                logger.debug(f"Следующий канал {next_channel} готов после интервала пары")
-                                break
-                
-                if next_channel is None:
-                    continue
-                    
-                message_id = await Repository.get_last_message(next_channel)
-                
-                if not message_id:
-                    logger.warning(f"Не найдено сообщение для канала {next_channel}")
-                    
-                    latest_id = await self.context.find_latest_message(next_channel)
-                    if latest_id:
-                        message_id = latest_id
-                        await Repository.save_last_message(next_channel, latest_id)
-                    else:
-                        self._channel_last_post[next_channel] = now
-                        continue
-                
-                logger.info(f"Попытка пересылки сообщения {message_id} из канала {next_channel}")
-                success = await self.context._forward_message(next_channel, message_id)
-                
-                if success:
-                    now = datetime.now().timestamp()
-                    self._channel_last_post[next_channel] = now
-                    self._last_global_post_time = now
-                    self._last_processed_channel = next_channel
-                    
-                    next_global_time = now + self.interval
-                    next_time_str = datetime.fromtimestamp(next_global_time).strftime('%H:%M:%S')
-                    
-                    minutes = self.interval // 60
-                    logger.info(f"Переслано из канала {next_channel}. Следующая пересылка из этого канала через {minutes} минут (в {next_time_str}).")
-                
-            except asyncio.CancelledError:
-                logger.info("Задача рассылки отменена")
-                break
-            except Exception as e:
-                logger.error(f"Ошибка в периодической рассылке: {e}")
-                await asyncio.sleep(60)
+                    interval_str = f"{hours} ч"
+            else:
+                interval_str = f"{self.interval // 60} мин"
+            
+            # Определяем следующий канал
+            next_channel = source_channels[self._current_channel_index]
+            
+            logger.info(f"Следующая ротация через {interval_str} (в {next_time_str}). "
+                      f"Будет переслано сообщение из канала {next_channel}")
+            
+            return True
+        else:
+            # Если пересылка не удалась, переходим к следующему каналу
+            logger.error(f"Не удалось переслать и закрепить сообщение из канала {channel_id}")
+            self._current_channel_index = (self._current_channel_index + 1) % len(source_channels)
+            return False
+
                 
 class BotContext:
-    """Context class that maintains current bot state"""
+    """Контекстный класс, управляющий состоянием бота"""
     
     def __init__(self, bot, config):
         self.bot = bot
@@ -243,9 +242,16 @@ class BotContext:
     async def handle_message(self, channel_id: str, message_id: int) -> None:
         await self.state.handle_message(channel_id, message_id)
     
+    async def rotate_now(self) -> bool:
+        """Немедленно выполняет ротацию на следующий канал"""
+        if not isinstance(self.state, RunningState):
+            logger.warning("Нельзя выполнить немедленную ротацию: бот не запущен")
+            return False
+        
+        return await self.state._rotate_to_next_channel()
     
-    async def _forward_message(self, channel_id: str, message_id: int) -> bool:
-        """Forward a message to all target chats (groups/supergroups, not channels)"""
+    async def forward_and_pin_message(self, channel_id: str, message_id: int) -> bool:
+        """Пересылает сообщение во все целевые чаты и закрепляет его"""
         success = False
         target_chats = await Repository.get_target_chats()
         
@@ -259,33 +265,54 @@ class BotContext:
                 continue
                 
             try:
+                # Получаем информацию о чате
                 chat_info = await self.bot.get_chat(chat_id)
+                
+                # Проверяем, что это не канал (в каналах нельзя закреплять сообщения с помощью бота)
                 if chat_info.type == 'channel':
-                    logger.info(f"Пропускаю пересылку в канал {chat_id} (каналы не являются целевыми)")
+                    logger.info(f"Пропускаю пересылку с закреплением в канал {chat_id} (только группы/супергруппы поддерживаются)")
                     continue
-                    
-                await self.bot.forward_message(
+                
+                # Пересылаем сообщение
+                forwarded_message = await self.bot.forward_message(
                     chat_id=chat_id,
                     from_chat_id=channel_id,
                     message_id=message_id
                 )
+                
+                # Открепляем предыдущее сообщение, если оно есть
+                old_pinned_id = await Repository.get_pinned_message(str(chat_id))
+                if old_pinned_id:
+                    try:
+                        await self.bot.unpin_chat_message(
+                            chat_id=chat_id,
+                            message_id=old_pinned_id
+                        )
+                        logger.info(f"Откреплено предыдущее сообщение {old_pinned_id} в чате {chat_id}")
+                    except Exception as e:
+                        logger.warning(f"Не удалось открепить предыдущее сообщение {old_pinned_id} в чате {chat_id}: {e}")
+                
+                # Закрепляем новое сообщение
+                await self.bot.pin_chat_message(
+                    chat_id=chat_id,
+                    message_id=forwarded_message.message_id,
+                    disable_notification=True
+                )
+                
+                # Сохраняем ID закрепленного сообщения
+                await Repository.save_pinned_message(str(chat_id), forwarded_message.message_id)
+                
+                # Логируем статистику
                 await Repository.log_forward(message_id)
                 success = True
-                logger.info(f"Переслано в {chat_id}")
+                logger.info(f"Сообщение {message_id} переслано и закреплено в чате {chat_id}")
             except Exception as e:
-                logger.error(f"Ошибка при пересылке в {chat_id}: {e}")
+                logger.error(f"Ошибка при пересылке/закреплении в {chat_id}: {e}")
 
         return success
     
-    async def _notify_owner(self, message: str):
-        """Send notification to bot owner (for compatibility)"""
-        try:
-            await self.bot.send_message(self.config.owner_id, message)
-        except Exception as e:
-            logger.error(f"Не удалось уведомить владельца: {e}")
-            
     async def _notify_admins(self, message: str):
-        """Send notification to all bot admins"""
+        """Отправка уведомления всем администраторам бота"""
         for admin_id in self.config.admin_ids:
             try:
                 await self.bot.send_message(admin_id, message)

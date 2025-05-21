@@ -16,7 +16,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 # Импортируем наши модули
 from utils.config import Config
-from utils.bot_state import BotContext, IdleState, RunningState
+from utils.bot_state import BotContext, BotState, IdleState, RunningState
 from utils.keyboard_factory import KeyboardFactory
 from database.repository import Repository, DatabaseConnectionPool
 from services.chat_cache import ChatCacheService, CacheObserver, ChatInfo
@@ -29,6 +29,7 @@ from commands.commands import (
     TestMessageCommand,
     FindLastMessageCommand
 )
+from utils.message_utils import find_latest_message as find_msg
 
 import multiprocessing
 from multiprocessing import Process
@@ -663,7 +664,8 @@ class ForwarderBot(CacheObserver):
             self.add_channel_prompt,
             Command("addchannel")
         )
-        
+        self.dp.my_chat_member.register(self.handle_chat_member)
+
         # Обработчик для постов в канале
         self.dp.channel_post.register(self.handle_channel_post)
         # Обработчики callback-запросов
@@ -700,7 +702,6 @@ class ForwarderBot(CacheObserver):
             )
         
         # Обработчик для добавления бота в чаты
-        self.dp.my_chat_member.register(self.handle_chat_member)
 
     async def _start_rotation_task(self, interval: int = 7200) -> None:
             """Запускает ротацию закрепленных сообщений с указанным интервалом"""
@@ -716,7 +717,6 @@ class ForwarderBot(CacheObserver):
         return await self.state._rotate_to_next_channel()
 
     
-
     async def forward_now_handler(self, callback: types.CallbackQuery):
         """Обработчик для кнопки немедленной ротации"""
         if not self.is_admin(callback.from_user.id):
@@ -728,8 +728,8 @@ class ForwarderBot(CacheObserver):
             success = await self.context.rotate_now()
         else:
             # Если бот не запущен, запускаем его и выполняем ротацию
-            await self.context._start_rotation_task()
-            success = True
+            await self.context.state.start()  # Запускаем бота
+            success = isinstance(self.context.state, RunningState)
         
         if success:
             await callback.message.edit_text(
@@ -758,10 +758,36 @@ class ForwarderBot(CacheObserver):
         if len(parts) != 3:
             await callback.answer("Неверный формат данных")
             return
-            
+                
         chat_id = int(parts[2])
         
         try:
+            # Проверяем права бота в чате
+            bot_id = (await self.bot.get_me()).id
+            chat_member = await self.bot.get_chat_member(chat_id, bot_id)
+            
+            if chat_member.status != "administrator":
+                await callback.message.edit_text(
+                    f"⚠️ Бот не является администратором в чате {chat_id}.\n"
+                    "Добавьте бота как администратора с правами на закрепление сообщений.",
+                    reply_markup=KeyboardFactory.create_chat_list_keyboard(
+                        await self._fetch_chat_info()  # Использование вспомогательного метода
+                    )
+                )
+                await callback.answer()
+                return
+                
+            if chat_member.status == "administrator" and not getattr(chat_member, "can_pin_messages", False):
+                await callback.message.edit_text(
+                    f"⚠️ У бота нет прав на закрепление сообщений в чате {chat_id}.\n"
+                    "Измените права бота, предоставив возможность закреплять сообщения.",
+                    reply_markup=KeyboardFactory.create_chat_list_keyboard(
+                        await self._fetch_chat_info()  # Использование вспомогательного метода
+                    )
+                )
+                await callback.answer()
+                return
+            
             # Отправляем тестовое сообщение в чат
             test_message = await self.bot.send_message(
                 chat_id,
@@ -782,28 +808,54 @@ class ForwarderBot(CacheObserver):
             await callback.message.edit_text(
                 f"✅ Тестовое сообщение успешно отправлено и закреплено в чате {chat_id}",
                 reply_markup=KeyboardFactory.create_chat_list_keyboard(
-                    await self._get_chat_info()
+                    await self._fetch_chat_info()  # Использование вспомогательного метода
                 )
             )
             
             # Через 5 секунд открепляем сообщение для завершения теста
             await asyncio.sleep(5)
             
-            await self.bot.unpin_chat_message(
-                chat_id=chat_id,
-                message_id=test_message.message_id
-            )
-            
+            try:
+                await self.bot.unpin_chat_message(
+                    chat_id=chat_id,
+                    message_id=test_message.message_id
+                )
+            except Exception as unpin_error:
+                logger.warning(f"Не удалось открепить сообщение в чате {chat_id}: {unpin_error}")
+                
         except Exception as e:
             await callback.message.edit_text(
                 f"❌ Ошибка при тестировании закрепления: {e}\n\n"
                 f"Проверьте, что бот имеет права администратора в чате {chat_id} с возможностью закреплять сообщения.",
                 reply_markup=KeyboardFactory.create_chat_list_keyboard(
-                    await self._get_chat_info()
+                    await self._fetch_chat_info()  # Использование вспомогательного метода
                 )
             )
             
         await callback.answer()
+
+    # Вспомогательный метод для получения информации о чатах
+    async def _fetch_chat_info(self) -> Dict[int, str]:
+        """Вспомогательный метод для получения информации о чатах"""
+        chats = await Repository.get_target_chats()
+        chat_info = {}
+        
+        for chat_id in chats:
+            try:
+                info = await self.cache_service.get_chat_info(self.bot, chat_id)
+                if info:
+                    chat_info[chat_id] = info.title
+                else:
+                    # Если не удалось получить из кэша, пробуем напрямую
+                    try:
+                        chat = await self.bot.get_chat(chat_id)
+                        chat_info[chat_id] = chat.title or f"Чат {chat_id}"
+                    except Exception:
+                        chat_info[chat_id] = f"Чат {chat_id}"
+            except Exception:
+                chat_info[chat_id] = f"Чат {chat_id}"
+        
+        return chat_info
 
     async def toggle_forwarding(self, callback: types.CallbackQuery):
         """Обработчик для кнопки запуска/остановки ротации закрепленных сообщений"""
@@ -950,17 +1002,52 @@ class ForwarderBot(CacheObserver):
                 "Например: 60 для интервала в 1 час"
             )
 
-    async def _get_chat_info(self) -> Dict[int, str]:
-        """Получение информации о чатах для отображения в меню"""
-        chats = await Repository.get_target_chats()
-        chat_info = {}
+    async def get_chat_info(self, bot: Bot, chat_id: int) -> Optional[ChatInfo]:
+        """Get chat info from cache or fetch from API"""
+        now = datetime.now().timestamp()
         
-        for chat_id in chats:
-            info = await self.cache_service.get_chat_info(self.bot, chat_id)
-            if info:
-                chat_info[chat_id] = info.title
-                
-        return chat_info
+        # Check cache first
+        if chat_id in self._cache:
+            chat_info = self._cache[chat_id]
+            if now - chat_info.last_updated < self._config.cache_ttl:
+                return chat_info
+
+        try:
+            # Fetch fresh data
+            chat = await bot.get_chat(chat_id)
+            
+            # Попытка получить количество участников
+            member_count = None
+            try:
+                member_count = await bot.get_chat_member_count(chat_id)
+            except Exception as e:
+                from loguru import logger
+                logger.warning(f"Не удалось получить количество участников для чата {chat_id}: {e}")
+            
+            info = ChatInfo(
+                id=chat_id,
+                title=chat.title or f"Чат {chat_id}",  # Fallback если название не удалось получить
+                type=chat.type,
+                member_count=member_count,
+                last_updated=now
+            )
+            
+            # Update cache
+            self._cache[chat_id] = info
+            
+            # Notify observers
+            await self._notify_observers(chat_id, info)
+            
+            # Cleanup old entries if cache is too large
+            if len(self._cache) > self._config.max_cache_size:
+                oldest = min(self._cache.items(), key=lambda x: x[1].last_updated)
+                del self._cache[oldest[0]]
+            
+            return info
+        except Exception as e:
+            from loguru import logger
+            logger.error(f"Error fetching chat info for {chat_id}: {e}")
+            return None
 
     async def add_channel_prompt(self, callback: types.CallbackQuery):
         """Улучшенное приглашение для добавления канала"""
@@ -981,6 +1068,10 @@ class ForwarderBot(CacheObserver):
             reply_markup=kb.as_markup()
         )
         await callback.answer()
+    async def find_latest_message(self, channel_id: str) -> Optional[int]:
+        """Метод-обертка для поиска последнего доступного сообщения в канале"""
+        last_id = await Repository.get_last_message(channel_id)
+        return await find_msg(self.bot, channel_id, self.config.owner_id, last_id)
 
     async def add_channel_input(self, callback: types.CallbackQuery):
         """Обработчик ввода ID/username канала"""
@@ -1138,40 +1229,82 @@ class ForwarderBot(CacheObserver):
         if not self.is_admin(callback.from_user.id):
             return
         
-        chats = await Repository.get_target_chats()
-        chat_info = {}
+        await callback.message.edit_text("🔄 Загрузка списка чатов...")
         
-        for chat_id in chats:
-            info = await self.cache_service.get_chat_info(self.bot, chat_id)
-            if info:
-                chat_info[chat_id] = info.title
-        
-        if not chats:
-            text = (
-                "Нет настроенных целевых чатов.\n"
-                "Убедитесь, что:\n"
-                "1. Бот добавлен в целевые чаты\n"
-                "2. Бот является администратором в исходных каналах"
-            )
-            markup = KeyboardFactory.create_main_keyboard(
-                isinstance(self.context.state, RunningState),
-            )
-        else:
-            text = "📡 Целевые чаты:\n\n"
+        try:
+            chats = await Repository.get_target_chats()
+            logger.info(f"Получено {len(chats)} чатов из базы данных: {chats}")
             
-            # Получаем информацию о закрепленных сообщениях
-            pinned_messages = await Repository.get_all_pinned_messages()
+            chat_info = {}
+            failed_chats = []
             
-            for chat_id, title in chat_info.items():
-                has_pinned = str(chat_id) in pinned_messages
-                pin_status = "📌" if has_pinned else "🔴"
-                text += f"{pin_status} {title} ({chat_id})\n"
+            for chat_id in chats:
+                try:
+                    # Сначала пробуем получить информацию через кэш
+                    info = await self.cache_service.get_chat_info(self.bot, chat_id)
+                    if info:
+                        chat_info[chat_id] = info.title
+                        logger.info(f"Успешно получена информация о чате {chat_id}: {info.title}")
+                    else:
+                        # Если кэш не помог, пробуем получить напрямую
+                        try:
+                            chat = await self.bot.get_chat(chat_id)
+                            chat_info[chat_id] = chat.title or f"Чат {chat_id}"
+                            logger.info(f"Напрямую получена информация о чате {chat_id}: {chat.title}")
+                        except Exception as direct_e:
+                            logger.error(f"Ошибка при прямом получении информации о чате {chat_id}: {direct_e}")
+                            # Если чат недоступен, добавляем его с общим названием
+                            chat_info[chat_id] = f"Недоступный чат {chat_id}"
+                            failed_chats.append(chat_id)
+                except Exception as e:
+                    logger.error(f"Ошибка при получении информации о чате {chat_id}: {e}")
+                    # При ошибке также добавляем чат с общим названием
+                    chat_info[chat_id] = f"Чат {chat_id}"
+            
+            if not chat_info:
+                text = (
+                    "Нет настроенных целевых чатов.\n"
+                    "Убедитесь, что:\n"
+                    "1. Бот добавлен в целевые чаты\n"
+                    "2. Бот является администратором в исходных каналах"
+                )
+                markup = KeyboardFactory.create_main_keyboard(
+                    isinstance(self.context.state, RunningState),
+                )
+            else:
+                text = "📡 Целевые чаты:\n\n"
                 
-            text += "\n📌 - есть закрепленное сообщение\n🔴 - нет закрепленного сообщения"
+                # Получаем информацию о закрепленных сообщениях
+                pinned_messages = await Repository.get_all_pinned_messages()
+                
+                for chat_id, title in chat_info.items():
+                    has_pinned = str(chat_id) in pinned_messages
+                    pin_status = "📌" if has_pinned else "🔴"
+                    
+                    # Добавляем индикатор для недоступных чатов
+                    is_failed = chat_id in failed_chats
+                    status_indicator = "⚠️ " if is_failed else ""
+                    
+                    text += f"{pin_status} {status_indicator}{title} ({chat_id})\n"
+                    
+                text += "\n📌 - есть закрепленное сообщение\n"
+                text += "🔴 - нет закрепленного сообщения\n"
+                
+                if failed_chats:
+                    text += "⚠️ - бот не имеет доступа к чату\n"
+                
+                markup = KeyboardFactory.create_chat_list_keyboard(chat_info)
             
-            markup = KeyboardFactory.create_chat_list_keyboard(chat_info)
+            await callback.message.edit_text(text, reply_markup=markup)
+        except Exception as e:
+            logger.error(f"Общая ошибка при загрузке списка чатов: {e}")
+            await callback.message.edit_text(
+                f"❌ Ошибка при загрузке списка чатов: {e}",
+                reply_markup=KeyboardFactory.create_main_keyboard(
+                    isinstance(self.context.state, RunningState),
+                )
+            )
         
-        await callback.message.edit_text(text, reply_markup=markup)
         await callback.answer()
 
     async def main_menu(self, callback: types.CallbackQuery):
@@ -1284,35 +1417,65 @@ class ForwarderBot(CacheObserver):
 
     async def handle_chat_member(self, update: types.ChatMemberUpdated):
         """Обработчик добавления/удаления бота из чатов"""
+        # Проверяем, что это событие касается бота
         if update.new_chat_member.user.id != self.bot.id:
             return
 
         chat_id = update.chat.id
-        is_member = update.new_chat_member.status in ['member', 'administrator']
+        old_status = update.old_chat_member.status
+        new_status = update.new_chat_member.status
         
-        if is_member and update.chat.type in ['group', 'supergroup']:
-            await Repository.add_target_chat(chat_id)
+        logger.info(f"Изменение статуса бота в чате {chat_id}: {old_status} → {new_status}")
+        
+        # Бот был добавлен или получил права администратора
+        if new_status in ['member', 'administrator'] and update.chat.type in ['group', 'supergroup']:
+            added = await Repository.add_target_chat(chat_id)
             self.cache_service.remove_from_cache(chat_id)
-            await self._notify_admins(f"Бот добавлен в {update.chat.type}: {update.chat.title} ({chat_id})")
-            logger.info(f"Бот добавлен в {update.chat.type}: {update.chat.title} ({chat_id})")
-        elif not is_member:
-            # Если бота удалили из чата, удаляем информацию о закрепленном сообщении
+            
+            if new_status == 'administrator':
+                # Проверяем права бота
+                pin_rights = getattr(update.new_chat_member, 'can_pin_messages', False)
+                
+                await self._notify_admins(
+                    f"🤖 Бот добавлен как администратор в {update.chat.type}: {update.chat.title} ({chat_id})\n"
+                    f"📌 Права на закрепление сообщений: {'✅' if pin_rights else '❌'}"
+                )
+                
+                if not pin_rights:
+                    await self.bot.send_message(
+                        chat_id,
+                        "⚠️ Внимание! Бот не имеет права на закрепление сообщений. "
+                        "Для полноценной работы пожалуйста предоставьте боту необходимые права администратора."
+                    )
+            else:
+                await self._notify_admins(f"🤖 Бот добавлен как участник в {update.chat.type}: {update.chat.title} ({chat_id})")
+                
+                try:
+                    await self.bot.send_message(
+                        chat_id,
+                        "⚠️ Внимание! Для корректной работы бота, пожалуйста, добавьте его как администратора "
+                        "с правами на закрепление сообщений."
+                    )
+                except Exception as e:
+                    logger.error(f"Не удалось отправить сообщение в чат {chat_id}: {e}")
+            
+            logger.info(
+                f"Бот {'добавлен' if added else 'уже был добавлен'} в {update.chat.type}: "
+                f"{update.chat.title} ({chat_id}) со статусом {new_status}"
+            )
+        
+        # Бот был удален или понижен в правах
+        elif old_status in ['member', 'administrator'] and new_status not in ['member', 'administrator']:
+            # Удаляем информацию о закрепленном сообщении
             await Repository.delete_pinned_message(str(chat_id))
             if str(chat_id) in self.pinned_messages:
                 del self.pinned_messages[str(chat_id)]
                 
             await Repository.remove_target_chat(chat_id)
             self.cache_service.remove_from_cache(chat_id)
-            await self._notify_admins(f"Бот удален из чата {chat_id}")
-            logger.info(f"Бот удален из чата {chat_id}")
-
-    async def _notify_owner(self, message: str):
-        """Отправка уведомления владельцу бота (для совместимости)"""
-        try:
-            await self.bot.send_message(self.config.owner_id, message)
-        except Exception as e:
-            logger.error(f"Не удалось уведомить владельца: {e}")
-            
+            await self._notify_admins(f"⚠️ Бот удален из чата {update.chat.title} ({chat_id})")
+            logger.info(f"Бот удален из чата {update.chat.title} ({chat_id})")
+    
     async def _notify_admins(self, message: str):
         """Отправка уведомления всем администраторам бота"""
         for admin_id in self.config.admin_ids:
@@ -1328,31 +1491,70 @@ class ForwarderBot(CacheObserver):
 
     async def start(self):
         """Запуск бота"""
-        await Repository.init_db()
-        
-        # Восстанавливаем закрепленные сообщения из базы данных
-        pinned_messages = await Repository.get_all_pinned_messages()
-        self.pinned_messages = pinned_messages
-        
-        # Устанавливаем интервал по умолчанию, если не задан
-        if not await Repository.get_config("rotation_interval"):
-            await Repository.set_config("rotation_interval", "7200")  # 2 часа по умолчанию
-        
-        logger.info("Бот успешно запущен!")
         try:
-            # Получаем ID последнего обновления, чтобы избежать дубликатов
-            offset = 0
+            # Инициализация базы данных
+            await Repository.init_db()
+            logger.info("База данных инициализирована")
+            
+            # Восстанавливаем закрепленные сообщения из базы данных
+            pinned_messages = await Repository.get_all_pinned_messages()
+            self.pinned_messages = pinned_messages
+            logger.info(f"Загружено {len(pinned_messages)} закрепленных сообщений")
+            
+            # Устанавливаем интервал по умолчанию, если не задан
+            if not await Repository.get_config("rotation_interval"):
+                await Repository.set_config("rotation_interval", "7200")  # 2 часа по умолчанию
+                logger.info("Установлен интервал ротации по умолчанию: 7200 секунд (2 часа)")
+            
+            # Проверяем целевые чаты
+            target_chats = await Repository.get_target_chats()
+            logger.info(f"Загружено {len(target_chats)} целевых чатов из базы данных: {target_chats}")
+            
+            # Проверяем исходные каналы
+            logger.info(f"Загружено {len(self.config.source_channels)} исходных каналов: {self.config.source_channels}")
+            
+            # Получаем информацию о боте
+            bot_info = await self.bot.get_me()
+            logger.info(f"Бот запущен: @{bot_info.username} (ID: {bot_info.id})")
+            
+            # Уведомляем администраторов о запуске
+            for admin_id in self.config.admin_ids:
+                try:
+                    await self.bot.send_message(
+                        admin_id, 
+                        f"✅ Бот @{bot_info.username} успешно запущен!\n\n"
+                        f"📊 Статистика:\n"
+                        f"• Исходных каналов: {len(self.config.source_channels)}\n"
+                        f"• Целевых чатов: {len(target_chats)}\n"
+                        f"• Закрепленных сообщений: {len(pinned_messages)}"
+                    )
+                except Exception as e:
+                    logger.error(f"Не удалось отправить уведомление администратору {admin_id}: {e}")
+            
+            logger.info("Бот успешно запущен!")
+            
             try:
-                updates = await self.bot.get_updates(limit=1, timeout=1)
-                if updates:
-                    offset = updates[-1].update_id + 1
-            except Exception as e:
-                logger.warning(f"Не удалось получить начальные обновления: {e}")
+                # Получаем ID последнего обновления, чтобы избежать дубликатов
+                offset = 0
+                try:
+                    updates = await self.bot.get_updates(limit=1, timeout=1)
+                    if updates:
+                        offset = updates[-1].update_id + 1
+                        logger.info(f"Установлен начальный offset: {offset}")
+                except Exception as e:
+                    logger.warning(f"Не удалось получить начальные обновления: {e}")
 
-            await self.dp.start_polling(self.bot, offset=offset)
-        finally:
-            self.cache_service.remove_observer(self)
-            await self.bot.session.close()
+                # Запускаем опрос обновлений
+                await self.dp.start_polling(self.bot, offset=offset)
+            finally:
+                # Отключаем наблюдателя кэша и закрываем соединение с ботом
+                self.cache_service.remove_observer(self)
+                await self.bot.session.close()
+        except Exception as e:
+            logger.critical(f"Критическая ошибка при запуске бота: {e}")
+            import traceback
+            logger.critical(f"Traceback: {traceback.format_exc()}")
+            raise
 
 # Обновляем класс KeyboardFactory для работы с новым функционалом
 class KeyboardFactory:
@@ -1444,10 +1646,6 @@ class BotContext:
     async def stop(self) -> None:
         await self.state.stop()
     
-    async def _start_rotation_task(self, interval: int = 7200) -> None:
-        """Запускает ротацию закрепленных сообщений с указанным интервалом"""
-        self.state = RunningState(self, interval)
-        await self._notify_admins(f"Бот начал ротацию закрепленных сообщений с интервалом {interval//60} минут")
     
     async def forward_and_pin_message(self, channel_id: str, message_id: int) -> bool:
         """Пересылает сообщение во все целевые чаты и закрепляет его"""
@@ -1557,192 +1755,6 @@ class BotContext:
                 await self.bot.send_message(admin_id, message)
             except Exception as e:
                 logger.error(f"Не удалось уведомить администратора {admin_id}: {e}")
-
-# Обновляем класс BotState для управления ротацией каналов
-class BotState(ABC):
-    """Абстрактный базовый класс для состояний бота"""
-    
-    @abstractmethod
-    async def start(self) -> None:
-        """Обработка действия запуска"""
-        pass
-    
-    @abstractmethod
-    async def stop(self) -> None:
-        """Обработка действия остановки"""
-        pass
-
-class IdleState:
-    """Состояние, когда бот не пересылает сообщения"""
-    
-    def __init__(self, bot_context):
-        self.context = bot_context
-    
-    async def start(self) -> None:
-        # Получаем интервал из базы (по умолчанию 2 часа = 7200 секунд)
-        interval = int(await Repository.get_config("rotation_interval", "7200"))
-        await self.context._start_rotation_task(interval)
-    
-    async def stop(self) -> None:
-        # Уже остановлен
-        pass
-    
-    async def handle_message(self, channel_id: str, message_id: int) -> None:
-        # Только сохраняем сообщение, но не делаем пересылку в состоянии Idle
-        await Repository.save_last_message(channel_id, message_id)
-        logger.info(f"Сохранено сообщение {message_id} из канала {channel_id} (бот остановлен)")
-        
-class RunningState:
-    """Состояние, когда бот активно пересылает и закрепляет сообщения с ротацией между каналами"""
-    
-    def __init__(self, bot_context, interval: int):
-        self.context = bot_context
-        self.interval = interval  # Интервал ротации в секундах (например, 7200 = 2 часа)
-        self._rotation_task = None
-        
-        # Индекс текущего канала для ротации
-        self._current_channel_index = 0
-        
-        # Запускаем задачу ротации
-        self._start_rotation_task()
-        
-        
-    def _start_rotation_task(self):
-        """Запуск задачи ротации каналов"""
-        if not self._rotation_task or self._rotation_task.done():
-            self._rotation_task = asyncio.create_task(self._channel_rotation())
-            
-    def update_interval(self, new_interval: int):
-        """Обновление интервала ротации"""
-        logger.info(f"Обновление интервала ротации с {self.interval} на {new_interval} секунд")
-        self.interval = new_interval
-        
-        # Перезапускаем задачу с новым интервалом
-        if self._rotation_task and not self._rotation_task.done():
-            logger.info("Отмена существующей задачи ротации")
-            self._rotation_task.cancel()
-        else:
-            logger.info("Предыдущая задача ротации не найдена или уже завершена")
-        
-        logger.info("Запуск новой задачи ротации")
-        self._start_rotation_task()
-    
-    async def start(self) -> None:
-        # Уже запущен
-        pass
-    
-    async def stop(self) -> None:
-        if self._rotation_task and not self._rotation_task.done():
-            self._rotation_task.cancel()
-        
-        await self.context._notify_admins("Бот остановил ротацию каналов")
-    
-    async def handle_message(self, channel_id: str, message_id: int) -> None:
-        """Обработка нового сообщения из канала"""
-        # Когда в канале появляется новое сообщение, сохраняем его ID
-        await Repository.save_last_message(channel_id, message_id)
-        logger.info(f"Сохранено новое сообщение {message_id} из канала {channel_id}")
-    
-    async def _channel_rotation(self):
-        """Основная задача ротации закрепленных сообщений по расписанию"""
-        try:
-            logger.info("Запущена задача ротации закрепленных сообщений")
-            
-            # Начинаем с первого канала
-            await self._rotate_to_next_channel()
-            
-            while True:
-                # Ждем указанный интервал до следующей ротации
-                logger.info(f"Ожидание {self.interval} секунд до следующей ротации закрепленных сообщений")
-                await asyncio.sleep(self.interval)
-                
-                # Переключаемся на следующий канал
-                await self._rotate_to_next_channel()
-                
-        except asyncio.CancelledError:
-            logger.info("Задача ротации закрепленных сообщений отменена")
-        except Exception as e:
-            logger.error(f"Ошибка в задаче ротации закрепленных сообщений: {e}")
-            import traceback
-            logger.error(f"Traceback: {traceback.format_exc()}")
-            
-            # Перезапускаем задачу в случае неожиданной ошибки через 10 секунд
-            await asyncio.sleep(10)
-            self._start_rotation_task()
-    
-    async def _rotate_to_next_channel(self) -> bool:
-        """Переключение на следующий канал в ротации и закрепление его сообщения"""
-        source_channels = self.context.config.source_channels
-        
-        if not source_channels:
-            logger.warning("Нет настроенных исходных каналов для ротации")
-            return False
-        
-        # Убедимся, что индекс в пределах списка каналов
-        if self._current_channel_index >= len(source_channels):
-            self._current_channel_index = 0
-        
-        # Получаем текущий канал
-        channel_id = source_channels[self._current_channel_index]
-        logger.info(f"Ротация на канал: {channel_id} (индекс: {self._current_channel_index})")
-        
-        # Получаем ID последнего сообщения в этом канале
-        message_id = await Repository.get_last_message(channel_id)
-        
-        if not message_id:
-            logger.warning(f"Не найдено последнее сообщение для канала {channel_id}")
-            
-            # Пытаемся найти последнее сообщение в канале
-            latest_id = await self.find_latest_message(channel_id)
-            if latest_id:
-                message_id = latest_id
-                await Repository.save_last_message(channel_id, latest_id)
-                logger.info(f"Найдено и сохранено новое последнее сообщение: {latest_id}")
-            else:
-                # Если не удалось найти сообщение, переходим к следующему каналу
-                logger.error(f"Не удалось найти ни одного сообщения в канале {channel_id}")
-                self._current_channel_index = (self._current_channel_index + 1) % len(source_channels)
-                return False
-        
-        logger.info(f"Будет переслано и закреплено сообщение: {message_id} из канала: {channel_id}")
-        
-        # Пересылаем и закрепляем сообщение во все целевые чаты
-        success = await self.context.forward_and_pin_message(channel_id, message_id)
-        
-        if success:
-            logger.info(f"Успешно переслано и закреплено сообщение из канала {channel_id}")
-            
-            # Подготавливаем следующий канал
-            self._current_channel_index = (self._current_channel_index + 1) % len(source_channels)
-            
-            # Рассчитываем время следующей ротации для логирования
-            next_time = datetime.now() + timedelta(seconds=self.interval)
-            next_time_str = next_time.strftime('%H:%M:%S')
-            
-            # Форматируем интервал для удобства чтения
-            if self.interval >= 3600:
-                hours = self.interval // 3600
-                minutes = (self.interval % 3600) // 60
-                if minutes > 0:
-                    interval_str = f"{hours} ч {minutes} мин"
-                else:
-                    interval_str = f"{hours} ч"
-            else:
-                interval_str = f"{self.interval // 60} мин"
-            
-            # Определяем следующий канал
-            next_channel = source_channels[self._current_channel_index]
-            
-            logger.info(f"Следующая ротация через {interval_str} (в {next_time_str}). "
-                      f"Будет переслано сообщение из канала {next_channel}")
-            
-            return True
-        else:
-            # Если пересылка не удалась, переходим к следующему каналу
-            logger.error(f"Не удалось переслать и закрепить сообщение из канала {channel_id}")
-            self._current_channel_index = (self._current_channel_index + 1) % len(source_channels)
-            return False
-
 
 # Update the main function to handle cleanup
 async def main():

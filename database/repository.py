@@ -158,24 +158,51 @@ class Repository:
         try:
             async with DatabaseConnectionPool.get_connection() as db:
                 async with db.execute("SELECT chat_id FROM target_chats") as cursor:
-                    return [row[0] for row in await cursor.fetchall()]
+                    result = await cursor.fetchall()
+                    chat_ids = [row[0] for row in result]
+                    logger.debug(f"Получено {len(chat_ids)} целевых чатов из базы данных: {chat_ids}")
+                    return chat_ids
         except Exception as e:
             logger.error(f"Ошибка при получении целевых чатов: {e}")
             return []
-
     @staticmethod
-    async def add_target_chat(chat_id: int) -> None:
-        """Add new target chat"""
+    async def add_target_chat(chat_id: int) -> bool:
+        """Add new target chat and return success status"""
         try:
+            # Проверяем, существует ли уже этот чат
             async with DatabaseConnectionPool.get_connection() as db:
+                async with db.execute(
+                    "SELECT chat_id FROM target_chats WHERE chat_id = ?", 
+                    (chat_id,)
+                ) as cursor:
+                    existing = await cursor.fetchone()
+                
+                if existing:
+                    logger.debug(f"Чат {chat_id} уже существует в базе данных")
+                    return False
+                
                 await db.execute(
-                    "INSERT OR IGNORE INTO target_chats (chat_id) VALUES (?)",
+                    "INSERT INTO target_chats (chat_id) VALUES (?)",
                     (chat_id,)
                 )
                 await db.commit()
-                logger.info(f"Добавлен целевой чат: {chat_id}")
+                
+                # Проверяем, действительно ли добавлен чат
+                async with db.execute(
+                    "SELECT chat_id FROM target_chats WHERE chat_id = ?", 
+                    (chat_id,)
+                ) as cursor:
+                    success = await cursor.fetchone() is not None
+                
+                if success:
+                    logger.info(f"Добавлен целевой чат: {chat_id}")
+                    return True
+                else:
+                    logger.error(f"Не удалось подтвердить добавление чата {chat_id}")
+                    return False
         except Exception as e:
             logger.error(f"Ошибка при добавлении целевого чата {chat_id}: {e}")
+            return False
 
     @staticmethod
     async def remove_target_chat(chat_id: int) -> None:
