@@ -19,7 +19,7 @@ class KeyboardFactory:
         kb.button(text="🤖 Клонировать бота", callback_data="clone_bot")
         kb.button(text="👥 Управление клонами", callback_data="manage_clones")
         kb.button(text="💬 Список целевых чатов", callback_data="list_chats")
-        kb.button(text="📌 Немедленная пересылка", callback_data="forward_now")
+        kb.button(text="📌 Немедленная ротация", callback_data="forward_now")
         kb.adjust(2)
         return kb.as_markup()
 

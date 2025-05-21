@@ -4,7 +4,7 @@ import os
 import json
 import shutil
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any, Set
 import multiprocessing
 from multiprocessing import Process
@@ -30,6 +30,9 @@ from commands.commands import (
     FindLastMessageCommand
 )
 
+import multiprocessing
+from multiprocessing import Process
+
 class BotManager:
     """Manages multiple bot instances"""
     _instance = None
@@ -43,7 +46,6 @@ class BotManager:
             cls._instance.bots = cls._instance.manager.dict()
             cls._instance.processes = {}
             
-            from loguru import logger
             logger.info("BotManager singleton created")
         return cls._instance
     
@@ -56,7 +58,6 @@ class BotManager:
         }
         self.processes[bot_id] = process
         
-        from loguru import logger
         logger.info(f"Added bot {bot_id} to manager. Total bots: {len(self.bots)}")
         logger.debug(f"Current bots: {list(self.bots.keys())}")
     
@@ -76,17 +77,11 @@ class BotManager:
     
     def list_bots(self):
         """List all managed bots"""
-        from loguru import logger
         logger.debug(f"Listing bots. Total: {len(self.bots)}, Keys: {list(self.bots.keys())}")
         return dict(self.bots)
-
-
-
-# Add this function to run a bot in a separate process
 def run_bot_process(bot_token: str, owner_id: int, source_channels: list, bot_id: str):
     """Wrapper to run bot in a separate process"""
     # Set up logging for the subprocess
-    from loguru import logger
     logger.add(f"bot_{bot_id}.log", rotation="10 MB")
     
     # Create new event loop for this process
@@ -100,8 +95,7 @@ def run_bot_process(bot_token: str, owner_id: int, source_channels: list, bot_id
     finally:
         loop.close()
 
-
-# Add this function to run a bot in a separate process
+# Function to run a bot instance 
 async def run_bot_instance(bot_token: str, owner_id: int, source_channels: list, bot_id: str):
     """Run a bot instance with specific configuration"""
     import os
@@ -122,6 +116,7 @@ async def run_bot_instance(bot_token: str, owner_id: int, source_channels: list,
     config.source_channels = source_channels
     
     # Create a new bot instance
+    from bot import ForwarderBot  # Adjust import as needed for zakrepbot
     bot_instance = ForwarderBot()
     bot_instance.bot_id = bot_id  # Add identifier
     
@@ -132,9 +127,10 @@ async def run_bot_instance(bot_token: str, owner_id: int, source_channels: list,
         raise
 
 
+
 class ForwarderBot(CacheObserver):
     """Основной класс бота для пересылки сообщений из каналов в чаты с автозакреплением"""
-    
+
     def __init__(self):
         self.config = Config()
         self.bot = Bot(token=self.config.bot_token)
@@ -143,65 +139,23 @@ class ForwarderBot(CacheObserver):
         self.cache_service = ChatCacheService()
         self.awaiting_channel_input = None  # Отслеживание ввода канала
         self.awaiting_interval_input = None  # Отслеживание ввода интервала
-        
+        self.bot_manager = BotManager()
+        self.bot_id = "main"  # Identifier for the main bot
+        self.child_bots = []  # Track spawned bots
+        self.awaiting_clone_token = None  # Track if waiting for clone token
         # Словарь для хранения ID закрепленных сообщений в чатах
         self.pinned_messages = {}
+        
+        # Add this line to create the keyboard factory
+        self.keyboard_factory = KeyboardFactory()
         
         # Регистрируем себя как наблюдатель кэша
         self.cache_service.add_observer(self)
         
         # Настраиваем обработчики
         self._setup_handlers()
-
-    async def clone_bot_prompt(self, callback: types.CallbackQuery):
-        """Prompt for cloning the bot"""
-        if callback.from_user.id != self.config.owner_id:
-            return
-        
-        # Set state to wait for new token
-        self.awaiting_clone_token = callback.from_user.id
-        
-        kb = InlineKeyboardBuilder()
-        kb.button(text="Отмена", callback_data="back_to_main")
-        
-        await callback.message.edit_text(
-            "🤖 Клонирование бота\n\n"
-            "1. Создайте нового бота через @BotFather\n"
-            "2. Получите новый токен бота\n"
-            "3. Отправьте токен сюда\n\n"
-            "После проверки токена вы сможете выбрать:\n"
-            "• Запустить клон в текущем процессе\n"
-            "• Создать файлы для отдельного запуска\n\n"
-            "Отправьте новый токен сообщением 💬",
-            reply_markup=kb.as_markup()
-        )
-        await callback.answer()
-
     # Let's also add the overwrite_clone method that was referenced earlier
-    async def overwrite_clone(self, callback: types.CallbackQuery):
-        """Handler for overwriting existing clone"""
-        if callback.from_user.id != self.config.owner_id:
-            return
-        
-        # Parse data: overwrite_clone_dirname_token
-        parts = callback.data.split('_', 3)
-        if len(parts) != 4:
-            await callback.answer("Ошибка в данных")
-            return
-        
-        clone_dir = parts[2]
-        new_token = parts[3]
-        
-        # Delete existing clone
-        current_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        clone_path = os.path.join(os.path.dirname(current_dir), clone_dir)
-        
-        if os.path.exists(clone_path):
-            shutil.rmtree(clone_path)
-        
-        # Perform clone
-        await self._perform_bot_clone(new_token, clone_dir, callback.message)
-        await callback.answer()
+    
     async def _perform_bot_clone(self, new_token: str, clone_dir: str, progress_msg=None):
         """Perform the actual bot cloning"""
         try:
@@ -211,8 +165,9 @@ class ForwarderBot(CacheObserver):
             await test_bot.session.close()
             
             # Get paths
-            current_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-            clone_path = os.path.join(os.path.dirname(current_dir), clone_dir)
+            current_dir = os.path.dirname(os.path.abspath(__file__))
+            parent_dir = os.path.dirname(current_dir)
+            clone_path = os.path.join(parent_dir, clone_dir)
             
             # Create clone directory
             os.makedirs(clone_path, exist_ok=True)
@@ -240,15 +195,15 @@ class ForwarderBot(CacheObserver):
             
             # Create new .env file with new token
             env_content = f"""# Telegram Bot Token from @BotFather
-BOT_TOKEN={new_token}
+    BOT_TOKEN={new_token}
 
-# Your Telegram user ID (get from @userinfobot)
-OWNER_ID={self.config.owner_id}
+    # Your Telegram user ID (get from @userinfobot)
+    OWNER_ID={self.config.owner_id}
 
-# Source channel username or ID (bot must be admin)
-# Can be either numeric ID (-100...) or channel username without @
-SOURCE_CHANNEL={self.config.source_channels[0] if self.config.source_channels else ''}
-"""
+    # Source channel username or ID (bot must be admin)
+    # Can be either numeric ID (-100...) or channel username without @
+    SOURCE_CHANNEL={self.config.source_channels[0] if self.config.source_channels else ''}
+    """
             
             with open(os.path.join(clone_path, '.env'), 'w') as f:
                 f.write(env_content)
@@ -262,9 +217,9 @@ SOURCE_CHANNEL={self.config.source_channels[0] if self.config.source_channels el
             
             # Create a start script for Linux
             start_script = f"""#!/bin/bash
-cd "{clone_path}"
-python bot.py
-"""
+    cd "{clone_path}"
+    python bot.py
+    """
             
             start_script_path = os.path.join(clone_path, 'start_bot.sh')
             with open(start_script_path, 'w') as f:
@@ -275,10 +230,10 @@ python bot.py
             
             # Create Windows start script
             start_script_windows = f"""@echo off
-cd /d "{clone_path}"
-python bot.py
-pause
-"""
+    cd /d "{clone_path}"
+    python bot.py
+    pause
+    """
             
             with open(os.path.join(clone_path, 'start_bot.bat'), 'w') as f:
                 f.write(start_script_windows)
@@ -286,35 +241,35 @@ pause
             # Create README.md for the clone
             readme_content = f"""# Bot Clone: @{bot_info.username}
 
-This is a clone of the main forwarding bot.
+    This is a clone of the main forwarding bot.
 
-## Configuration
-- Bot Token: Configured in .env
-- Owner ID: {self.config.owner_id}
-- Source Channels: {', '.join(self.config.source_channels)}
+    ## Configuration
+    - Bot Token: Configured in .env
+    - Owner ID: {self.config.owner_id}
+    - Source Channels: {', '.join(self.config.source_channels)}
 
-## Running the bot
+    ## Running the bot
 
-### Linux/Mac:
-```bash
-./start_bot.sh
-```
+    ### Linux/Mac:
+    ```bash
+    ./start_bot.sh
+    ```
 
-### Windows:
-```bash
-start_bot.bat
-```
+    ### Windows:
+    ```bash
+    start_bot.bat
+    ```
 
-### Manual:
-```bash
-python bot.py
-```
+    ### Manual:
+    ```bash
+    python bot.py
+    ```
 
-## Important Notes
-- Make sure the bot is admin in all source channels
-- The bot will forward messages to the same target chats as the main bot
-- Database is separate from the main bot
-"""
+    ## Important Notes
+    - Make sure the bot is admin in all source channels
+    - The bot will forward messages to the same target chats as the main bot
+    - Database is separate from the main bot
+    """
             
             with open(os.path.join(clone_path, 'README.md'), 'w') as f:
                 f.write(readme_content)
@@ -350,6 +305,7 @@ python bot.py
             raise
 
 
+
     async def create_clone_files(self, callback: types.CallbackQuery):
         """Create clone files for separate deployment"""
         if callback.from_user.id != self.config.owner_id:
@@ -376,7 +332,8 @@ python bot.py
             
             # Check if clone already exists
             current_dir = os.path.dirname(os.path.abspath(__file__))
-            clone_path = os.path.join(os.path.dirname(current_dir), clone_dir)
+            parent_dir = os.path.dirname(current_dir)
+            clone_path = os.path.join(parent_dir, clone_dir)
             
             if os.path.exists(clone_path):
                 kb = InlineKeyboardBuilder()
@@ -429,7 +386,7 @@ python bot.py
             bot_id = f"bot_{bot_info.username}"
             
             # Check if this bot is already running
-            if bot_id in self.bot_manager.processes:
+            if hasattr(self, 'bot_manager') and bot_id in self.bot_manager.processes:
                 if self.bot_manager.processes[bot_id].is_alive():
                     kb = InlineKeyboardBuilder()
                     kb.button(text="Остановить", callback_data=f"stop_clone_{bot_id}")
@@ -442,6 +399,14 @@ python bot.py
                     )
                     await callback.answer()
                     return
+            
+            # Ensure bot_manager exists
+            if not hasattr(self, 'bot_manager'):
+                self.bot_manager = BotManager()
+                
+            # Ensure child_bots list exists
+            if not hasattr(self, 'child_bots'):
+                self.child_bots = []
             
             # Create a new process for the bot
             process = Process(
@@ -478,12 +443,15 @@ python bot.py
             logger.error(f"Failed to start clone bot: {e}")
         
         await callback.answer()
-
     async def manage_clones(self, callback: types.CallbackQuery):
         """Manage running bot clones"""
         if callback.from_user.id != self.config.owner_id:
             return
         
+        # Ensure bot_manager exists
+        if not hasattr(self, 'bot_manager'):
+            self.bot_manager = BotManager()
+            
         bots = self.bot_manager.list_bots()
         
         # Count clones (excluding main bot)
@@ -545,6 +513,10 @@ python bot.py
         bot_id = callback.data.replace("stop_clone_", "")
         
         try:
+            # Ensure bot_manager exists
+            if not hasattr(self, 'bot_manager'):
+                self.bot_manager = BotManager()
+                
             self.bot_manager.remove_bot(bot_id)
             await callback.answer(f"Бот {bot_id} остановлен")
         except Exception as e:
@@ -594,11 +566,12 @@ python bot.py
     # Add cleanup method to stop all child bots on shutdown
     async def cleanup(self):
         """Stop all child bots"""
-        for bot_id in self.child_bots:
-            try:
-                self.bot_manager.remove_bot(bot_id)
-            except Exception as e:
-                logger.error(f"Error stopping bot {bot_id}: {e}")
+        if hasattr(self, 'child_bots') and hasattr(self, 'bot_manager'):
+            for bot_id in self.child_bots:
+                try:
+                    self.bot_manager.remove_bot(bot_id)
+                except Exception as e:
+                    logger.error(f"Error stopping bot {bot_id}: {e}")
 
     async def clone_bot_prompt(self, callback: types.CallbackQuery):
         """Prompt for cloning the bot"""
@@ -640,8 +613,9 @@ python bot.py
         new_token = parts[3]
         
         # Delete existing clone
-        current_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        clone_path = os.path.join(os.path.dirname(current_dir), clone_dir)
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        parent_dir = os.path.dirname(current_dir)
+        clone_path = os.path.join(parent_dir, clone_dir)
         
         if os.path.exists(clone_path):
             shutil.rmtree(clone_path)
@@ -649,6 +623,7 @@ python bot.py
         # Perform clone
         await self._perform_bot_clone(new_token, clone_dir, callback.message)
         await callback.answer()
+
     def is_admin(self, user_id: int) -> bool:
         """Проверка, является ли пользователь администратором"""
         return self.config.is_admin(user_id)
@@ -691,12 +666,6 @@ python bot.py
         
         # Обработчик для постов в канале
         self.dp.channel_post.register(self.handle_channel_post)
-        
-        self.dp.message.register(
-            self.clone_bot_submit,
-            lambda message: hasattr(self, 'awaiting_clone_token') and 
-                          self.awaiting_clone_token == message.from_user.id
-        )
         # Обработчики callback-запросов
         callbacks = {
             "toggle_forward": self.toggle_forwarding,
@@ -717,9 +686,12 @@ python bot.py
             "clone_files_": self.create_clone_files,
             "stop_clone_": self.stop_clone,
             "manage_clones": self.manage_clones
-
         }
-        
+        self.dp.message.register(
+            self.clone_bot_submit,
+                lambda message: hasattr(self, 'awaiting_clone_token') and 
+                self.awaiting_clone_token == message.from_user.id
+            )
         # Регистрируем обработчики с определенным порядком, чтобы избежать конфликтов
         for prefix, handler in callbacks.items():
             self.dp.callback_query.register(
@@ -730,62 +702,50 @@ python bot.py
         # Обработчик для добавления бота в чаты
         self.dp.my_chat_member.register(self.handle_chat_member)
 
-    async def find_latest_message(self, channel_id: str) -> Optional[int]:
-        """Вспомогательный метод для поиска последнего действительного сообщения в канале"""
-        try:
-            # Начинаем с разумно высокого числа и идем назад
-            max_id = 10000
-            
-            for test_id in range(max_id, 0, -1):
-                try:
-                    # Пытаемся получить информацию о сообщении
-                    msg = await self.bot.get_messages(channel_id, message_ids=test_id)
-                    if msg and not getattr(msg, 'empty', False):
-                        return test_id
-                except Exception:
-                    # Пропускаем ошибки для несуществующих сообщений
-                    pass
-                    
-                # Делаем паузу каждые 1000 проверок, чтобы не превысить лимиты API
-                if test_id % 1000 == 0:
-                    await asyncio.sleep(0.5)
-                    
-                # Не проверяем слишком много ID
-                if max_id - test_id > 5000:
-                    break
-                    
-            return None
-        except Exception as e:
-            logger.error(f"Ошибка при поиске последнего сообщения в канале {channel_id}: {e}")
-            return None
+    async def _start_rotation_task(self, interval: int = 7200) -> None:
+            """Запускает ротацию закрепленных сообщений с указанным интервалом"""
+            self.state = RunningState(self, interval)
+            await self._notify_admins(f"Бот начал ротацию закрепленных сообщений с интервалом {interval//60} минут")
+        
+    async def rotate_now(self) -> bool:
+        """Немедленно выполняет ротацию на следующий канал"""
+        if not isinstance(self.state, RunningState):
+            logger.warning("Нельзя выполнить немедленную ротацию: бот не запущен")
+            return False
+        
+        return await self.state._rotate_to_next_channel()
+
+    
 
     async def forward_now_handler(self, callback: types.CallbackQuery):
-        """Обработчик немедленной пересылки последнего сообщения"""
+        """Обработчик для кнопки немедленной ротации"""
         if not self.is_admin(callback.from_user.id):
             return
             
-        await callback.message.edit_text(
-            "🔄 Выполняю немедленную пересылку последнего сообщения из всех каналов...",
-            reply_markup=None
-        )
+        await callback.message.edit_text("🔄 Выполняю немедленную ротацию закрепленных сообщений...")
         
-        success = await self.context.forward_latest_messages()
+        if isinstance(self.context.state, RunningState):
+            success = await self.context.rotate_now()
+        else:
+            # Если бот не запущен, запускаем его и выполняем ротацию
+            await self.context._start_rotation_task()
+            success = True
         
         if success:
             await callback.message.edit_text(
-                "✅ Сообщения успешно пересланы и закреплены",
-                reply_markup=KeyboardFactory.create_main_keyboard(
-                    isinstance(self.context.state, RunningState),
+                "✅ Ротация успешно выполнена. Сообщение переслано и закреплено.",
+                reply_markup=self.keyboard_factory.create_main_keyboard(
+                    isinstance(self.context.state, RunningState)
                 )
             )
         else:
             await callback.message.edit_text(
-                "⚠️ Произошла ошибка при пересылке сообщений. Проверьте логи.",
-                reply_markup=KeyboardFactory.create_main_keyboard(
-                    isinstance(self.context.state, RunningState),
+                "⚠️ Ошибка при выполнении ротации. Проверьте наличие каналов и целевых чатов.",
+                reply_markup=self.keyboard_factory.create_main_keyboard(
+                    isinstance(self.context.state, RunningState)
                 )
             )
-            
+        
         await callback.answer()
 
     async def test_pin_handler(self, callback: types.CallbackQuery):
@@ -846,23 +806,20 @@ python bot.py
         await callback.answer()
 
     async def toggle_forwarding(self, callback: types.CallbackQuery):
-        """Обработчик для кнопки включения/выключения пересылки"""
+        """Обработчик для кнопки запуска/остановки ротации закрепленных сообщений"""
         if not self.is_admin(callback.from_user.id):
             return
 
         if isinstance(self.context.state, IdleState):
-            interval = await Repository.get_config("rotation_interval", "7200")  # 2 часа по умолчанию
-            await callback.message.edit_text(
-                f"🔄 Запуск ротации с интервалом {int(interval)//60} минут..."
-            )
-            await self.context.start()
+            await callback.message.edit_text("🔄 Запуск ротации закрепленных сообщений...")
+            await self.context.state.start()
         else:
-            await self.context.stop()
+            await self.context.state.stop()
 
         await callback.message.edit_text(
-            f"Пересылка {'запущена' if isinstance(self.context.state, RunningState) else 'остановлена'}!",
+            f"Ротация закрепленных сообщений {'запущена' if isinstance(self.context.state, RunningState) else 'остановлена'}!",
             reply_markup=KeyboardFactory.create_main_keyboard(
-                isinstance(self.context.state, RunningState),
+                isinstance(self.context.state, RunningState)
             )
         )
         await callback.answer()
@@ -892,26 +849,13 @@ python bot.py
         await callback.answer()
 
     async def set_interval_value(self, callback: types.CallbackQuery):
-        """Установка конкретного значения интервала"""
+        """Обработчик для установки интервала ротации"""
         if not self.is_admin(callback.from_user.id):
             return
-            
+        
+        # Парсим значение интервала из callback данных
         parts = callback.data.split('_')
         if len(parts) != 3:
-            # Если это запрос на ручной ввод интервала
-            if callback.data == "set_interval_value_custom":
-                self.awaiting_interval_input = callback.from_user.id
-                
-                kb = InlineKeyboardBuilder()
-                kb.button(text="Отмена", callback_data="set_interval")
-                
-                await callback.message.edit_text(
-                    "⏱️ Введите интервал ротации в минутах (от 5 до 1440):",
-                    reply_markup=kb.as_markup()
-                )
-                await callback.answer()
-                return
-                
             await callback.answer("Неверный формат данных")
             return
             
@@ -919,6 +863,7 @@ python bot.py
             # Значение в секундах
             interval = int(parts[2])
             
+            # Сохраняем интервал в базе данных
             await Repository.set_config("rotation_interval", str(interval))
             
             # Если бот работает, обновляем интервал
@@ -936,9 +881,10 @@ python bot.py
                 display = f"{interval // 60}м"
                 
             await callback.message.edit_text(
-                f"✅ Интервал ротации установлен на {display}",
-                reply_markup=KeyboardFactory.create_main_keyboard(
-                    isinstance(self.context.state, RunningState),
+                f"✅ Интервал ротации установлен на {display}\n\n"
+                f"Бот будет пересылать и закреплять сообщения из каналов по очереди с этим интервалом.",
+                reply_markup=self.keyboard_factory.create_main_keyboard(
+                    isinstance(self.context.state, RunningState)
                 )
             )
             
@@ -1414,7 +1360,7 @@ class KeyboardFactory:
     
     @staticmethod
     def create_main_keyboard(running: bool = False) -> Any:
-        """Создание клавиатуры главного меню"""
+        """Create main menu keyboard"""
         kb = InlineKeyboardBuilder()
         kb.button(
             text="🔄 Запустить ротацию" if not running else "⏹ Остановить ротацию",
@@ -1422,8 +1368,10 @@ class KeyboardFactory:
         )
         kb.button(text="⏱️ Установить интервал", callback_data="set_interval")
         kb.button(text="⚙️ Управление каналами", callback_data="channels")
+        kb.button(text="🤖 Клонировать бота", callback_data="clone_bot")  # Добавить эту кнопку
+        kb.button(text="👥 Управление клонами", callback_data="manage_clones")  # Добавить эту кнопку
         kb.button(text="💬 Список целевых чатов", callback_data="list_chats")
-        kb.button(text="📌 Немедленная пересылка", callback_data="forward_now")
+        kb.button(text="📌 Немедленная ротация", callback_data="forward_now")
         kb.adjust(2)
         return kb.as_markup()
 
@@ -1496,6 +1444,11 @@ class BotContext:
     async def stop(self) -> None:
         await self.state.stop()
     
+    async def _start_rotation_task(self, interval: int = 7200) -> None:
+        """Запускает ротацию закрепленных сообщений с указанным интервалом"""
+        self.state = RunningState(self, interval)
+        await self._notify_admins(f"Бот начал ротацию закрепленных сообщений с интервалом {interval//60} минут")
+    
     async def forward_and_pin_message(self, channel_id: str, message_id: int) -> bool:
         """Пересылает сообщение во все целевые чаты и закрепляет его"""
         success = False
@@ -1511,11 +1464,12 @@ class BotContext:
                 continue
                 
             try:
+                # Получаем информацию о чате
                 chat_info = await self.bot.get_chat(chat_id)
                 
                 # Проверяем, что это не канал (в каналах нельзя закреплять сообщения с помощью бота)
                 if chat_info.type == 'channel':
-                    logger.info(f"Пропускаю пересылку в канал {chat_id} (нельзя закреплять сообщения в каналах)")
+                    logger.info(f"Пропускаю пересылку с закреплением в канал {chat_id} (только группы/супергруппы поддерживаются)")
                     continue
                 
                 # Пересылаем сообщение
@@ -1547,6 +1501,7 @@ class BotContext:
                 # Сохраняем ID закрепленного сообщения
                 await Repository.save_pinned_message(str(chat_id), forwarded_message.message_id)
                 
+                # Логируем статистику
                 await Repository.log_forward(message_id)
                 success = True
                 logger.info(f"Сообщение {message_id} переслано и закреплено в чате {chat_id}")
@@ -1617,35 +1572,40 @@ class BotState(ABC):
         """Обработка действия остановки"""
         pass
 
-class IdleState(BotState):
+class IdleState:
     """Состояние, когда бот не пересылает сообщения"""
     
     def __init__(self, bot_context):
         self.context = bot_context
     
     async def start(self) -> None:
+        # Получаем интервал из базы (по умолчанию 2 часа = 7200 секунд)
         interval = int(await Repository.get_config("rotation_interval", "7200"))
-        self.context.state = RunningState(self.context, interval)
-        await self.context._notify_admins("Бот начал ротацию каналов")
+        await self.context._start_rotation_task(interval)
     
     async def stop(self) -> None:
         # Уже остановлен
         pass
-
-class RunningState(BotState):
-    """Состояние, когда бот активно пересылает сообщения"""
+    
+    async def handle_message(self, channel_id: str, message_id: int) -> None:
+        # Только сохраняем сообщение, но не делаем пересылку в состоянии Idle
+        await Repository.save_last_message(channel_id, message_id)
+        logger.info(f"Сохранено сообщение {message_id} из канала {channel_id} (бот остановлен)")
+        
+class RunningState:
+    """Состояние, когда бот активно пересылает и закрепляет сообщения с ротацией между каналами"""
     
     def __init__(self, bot_context, interval: int):
         self.context = bot_context
-        self.interval = interval  # Интервал ротации в секундах
-        self._rotation_task: Optional[asyncio.Task] = None
-        self.auto_forward = True  # Всегда включено в этой реализации
+        self.interval = interval  # Интервал ротации в секундах (например, 7200 = 2 часа)
+        self._rotation_task = None
         
-        # Для отслеживания последнего обработанного канала
-        self._last_processed_channel_index = -1
+        # Индекс текущего канала для ротации
+        self._current_channel_index = 0
         
         # Запускаем задачу ротации
         self._start_rotation_task()
+        
         
     def _start_rotation_task(self):
         """Запуск задачи ротации каналов"""
@@ -1675,265 +1635,118 @@ class RunningState(BotState):
         if self._rotation_task and not self._rotation_task.done():
             self._rotation_task.cancel()
         
-        self.context.state = IdleState(self.context)
         await self.context._notify_admins("Бот остановил ротацию каналов")
     
+    async def handle_message(self, channel_id: str, message_id: int) -> None:
+        """Обработка нового сообщения из канала"""
+        # Когда в канале появляется новое сообщение, сохраняем его ID
+        await Repository.save_last_message(channel_id, message_id)
+        logger.info(f"Сохранено новое сообщение {message_id} из канала {channel_id}")
+    
     async def _channel_rotation(self):
-        """Задача ротации каналов по расписанию"""
+        """Основная задача ротации закрепленных сообщений по расписанию"""
         try:
-            logger.info("Запущена задача ротации каналов")
+            logger.info("Запущена задача ротации закрепленных сообщений")
             
-            # Начинаем с пересылки последних сообщений из всех каналов
-            success = await self.context.forward_latest_messages()
-            logger.info(f"Начальная пересылка сообщений - успешно: {success}")
+            # Начинаем с первого канала
+            await self._rotate_to_next_channel()
             
             while True:
-                # Выводим сообщение о начале ожидания
-                logger.info(f"Ожидание {self.interval} секунд до следующей ротации")
-                
-                # Ждем указанный интервал
+                # Ждем указанный интервал до следующей ротации
+                logger.info(f"Ожидание {self.interval} секунд до следующей ротации закрепленных сообщений")
                 await asyncio.sleep(self.interval)
                 
-                # Получаем список каналов
-                source_channels = self.context.config.source_channels
+                # Переключаемся на следующий канал
+                await self._rotate_to_next_channel()
                 
-                if not source_channels:
-                    logger.warning("Нет настроенных исходных каналов для ротации")
-                    continue
-                    
-                logger.info(f"Доступные каналы: {source_channels}")
-                
-                # Выбираем следующий канал по кругу
-                self._last_processed_channel_index = (self._last_processed_channel_index + 1) % len(source_channels)
-                channel_id = source_channels[self._last_processed_channel_index]
-                
-                logger.info(f"Выбран канал для ротации: {channel_id} (индекс: {self._last_processed_channel_index})")
-                
-                # Получаем ID последнего сообщения в этом канале
-                message_id = await Repository.get_last_message(channel_id)
-                
-                if not message_id:
-                    logger.warning(f"Не найдено последнее сообщение для канала {channel_id}")
-                    continue
-                    
-                logger.info(f"Найдено сообщение для пересылки: {message_id}")
-                
-                # Пересылаем и закрепляем сообщение
-                success = await self.context.forward_and_pin_message(channel_id, message_id)
-                
-                if success:
-                    logger.info(f"Успешно переслано сообщение из канала {channel_id}")
-                    logger.info(f"Следующая ротация через {self.interval // 60} минут")
-                else:
-                    logger.error(f"Не удалось переслать сообщение из канала {channel_id}")
-                    
         except asyncio.CancelledError:
-            logger.info("Задача ротации каналов отменена")
+            logger.info("Задача ротации закрепленных сообщений отменена")
         except Exception as e:
-            logger.error(f"Ошибка в задаче ротации каналов: {e}")
-            # Добавляем полный traceback для отладки
+            logger.error(f"Ошибка в задаче ротации закрепленных сообщений: {e}")
             import traceback
             logger.error(f"Traceback: {traceback.format_exc()}")
             
-            # Перезапускаем задачу в случае неожиданной ошибки
+            # Перезапускаем задачу в случае неожиданной ошибки через 10 секунд
             await asyncio.sleep(10)
             self._start_rotation_task()
-
-# Обновляем класс Repository для работы с закрепленными сообщениями
-class Repository:
-    """Реализация паттерна Repository для работы с базой данных"""
     
-    @staticmethod
-    async def close_db() -> None:
-        """Закрываем все соединения с базой данных"""
-        await DatabaseConnectionPool.close_all()
-    
-    @staticmethod
-    async def init_db() -> None:
-        """Инициализация схемы базы данных"""
-        async with DatabaseConnectionPool.get_connection() as db:
-            await db.executescript("""
-                CREATE TABLE IF NOT EXISTS config (
-                    key TEXT PRIMARY KEY,
-                    value TEXT
-                );
-                CREATE TABLE IF NOT EXISTS target_chats (
-                    chat_id INTEGER PRIMARY KEY,
-                    added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                );
-                CREATE TABLE IF NOT EXISTS forward_stats (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    message_id INTEGER,
-                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                );
-                CREATE TABLE IF NOT EXISTS last_messages (
-                    channel_id TEXT PRIMARY KEY,
-                    message_id INTEGER,
-                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                );
-                CREATE TABLE IF NOT EXISTS pinned_messages (
-                    chat_id TEXT PRIMARY KEY,
-                    message_id INTEGER,
-                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                );
-                CREATE INDEX IF NOT EXISTS idx_forward_stats_timestamp ON forward_stats(timestamp);
-                CREATE INDEX IF NOT EXISTS idx_target_chats_added_at ON target_chats(added_at);
-            """)
-            await db.commit()
+    async def _rotate_to_next_channel(self) -> bool:
+        """Переключение на следующий канал в ротации и закрепление его сообщения"""
+        source_channels = self.context.config.source_channels
+        
+        if not source_channels:
+            logger.warning("Нет настроенных исходных каналов для ротации")
+            return False
+        
+        # Убедимся, что индекс в пределах списка каналов
+        if self._current_channel_index >= len(source_channels):
+            self._current_channel_index = 0
+        
+        # Получаем текущий канал
+        channel_id = source_channels[self._current_channel_index]
+        logger.info(f"Ротация на канал: {channel_id} (индекс: {self._current_channel_index})")
+        
+        # Получаем ID последнего сообщения в этом канале
+        message_id = await Repository.get_last_message(channel_id)
+        
+        if not message_id:
+            logger.warning(f"Не найдено последнее сообщение для канала {channel_id}")
+            
+            # Пытаемся найти последнее сообщение в канале
+            latest_id = await self.find_latest_message(channel_id)
+            if latest_id:
+                message_id = latest_id
+                await Repository.save_last_message(channel_id, latest_id)
+                logger.info(f"Найдено и сохранено новое последнее сообщение: {latest_id}")
+            else:
+                # Если не удалось найти сообщение, переходим к следующему каналу
+                logger.error(f"Не удалось найти ни одного сообщения в канале {channel_id}")
+                self._current_channel_index = (self._current_channel_index + 1) % len(source_channels)
+                return False
+        
+        logger.info(f"Будет переслано и закреплено сообщение: {message_id} из канала: {channel_id}")
+        
+        # Пересылаем и закрепляем сообщение во все целевые чаты
+        success = await self.context.forward_and_pin_message(channel_id, message_id)
+        
+        if success:
+            logger.info(f"Успешно переслано и закреплено сообщение из канала {channel_id}")
+            
+            # Подготавливаем следующий канал
+            self._current_channel_index = (self._current_channel_index + 1) % len(source_channels)
+            
+            # Рассчитываем время следующей ротации для логирования
+            next_time = datetime.now() + timedelta(seconds=self.interval)
+            next_time_str = next_time.strftime('%H:%M:%S')
+            
+            # Форматируем интервал для удобства чтения
+            if self.interval >= 3600:
+                hours = self.interval // 3600
+                minutes = (self.interval % 3600) // 60
+                if minutes > 0:
+                    interval_str = f"{hours} ч {minutes} мин"
+                else:
+                    interval_str = f"{hours} ч"
+            else:
+                interval_str = f"{self.interval // 60} мин"
+            
+            # Определяем следующий канал
+            next_channel = source_channels[self._current_channel_index]
+            
+            logger.info(f"Следующая ротация через {interval_str} (в {next_time_str}). "
+                      f"Будет переслано сообщение из канала {next_channel}")
+            
+            return True
+        else:
+            # Если пересылка не удалась, переходим к следующему каналу
+            logger.error(f"Не удалось переслать и закрепить сообщение из канала {channel_id}")
+            self._current_channel_index = (self._current_channel_index + 1) % len(source_channels)
+            return False
 
-    @staticmethod
-    async def get_target_chats() -> List[int]:
-        """Получение списка ID целевых чатов"""
-        async with DatabaseConnectionPool.get_connection() as db:
-            async with db.execute("SELECT chat_id FROM target_chats") as cursor:
-                return [row[0] for row in await cursor.fetchall()]
-
-    @staticmethod
-    async def add_target_chat(chat_id: int) -> None:
-        """Добавление нового целевого чата"""
-        async with DatabaseConnectionPool.get_connection() as db:
-            await db.execute(
-                "INSERT OR IGNORE INTO target_chats (chat_id) VALUES (?)",
-                (chat_id,)
-            )
-            await db.commit()
-
-    @staticmethod
-    async def remove_target_chat(chat_id: int) -> None:
-        """Удаление целевого чата"""
-        async with DatabaseConnectionPool.get_connection() as db:
-            await db.execute(
-                "DELETE FROM target_chats WHERE chat_id = ?",
-                (chat_id,)
-            )
-            await db.commit()
-
-    @staticmethod
-    async def get_config(key: str, default: Optional[str] = None) -> Optional[str]:
-        """Получение значения конфигурации"""
-        async with DatabaseConnectionPool.get_connection() as db:
-            async with db.execute(
-                "SELECT value FROM config WHERE key = ?",
-                (key,)
-            ) as cursor:
-                row = await cursor.fetchone()
-                return row[0] if row else default
-
-    @staticmethod
-    async def set_config(key: str, value: str) -> None:
-        """Установка значения конфигурации"""
-        async with DatabaseConnectionPool.get_connection() as db:
-            await db.execute(
-                "INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)",
-                (key, str(value))
-            )
-            await db.commit()
-
-    @staticmethod
-    async def log_forward(message_id: int) -> None:
-        """Логирование пересланного сообщения"""
-        async with DatabaseConnectionPool.get_connection() as db:
-            await db.execute(
-                "INSERT INTO forward_stats (message_id) VALUES (?)",
-                (message_id,)
-            )
-            await db.commit()
-
-    @staticmethod
-    async def save_last_message(channel_id: str, message_id: int) -> None:
-        """Сохранение ID последнего сообщения для канала"""
-        async with DatabaseConnectionPool.get_connection() as db:
-            await db.execute(
-                """
-                INSERT OR REPLACE INTO last_messages 
-                (channel_id, message_id, timestamp) 
-                VALUES (?, ?, CURRENT_TIMESTAMP)
-                """,
-                (channel_id, message_id)
-            )
-            await db.commit()
-
-    @staticmethod
-    async def get_last_message(channel_id: str) -> Optional[int]:
-        """Получение ID последнего сообщения для канала"""
-        async with DatabaseConnectionPool.get_connection() as db:
-            async with db.execute(
-                "SELECT message_id FROM last_messages WHERE channel_id = ?",
-                (channel_id,)
-            ) as cursor:
-                row = await cursor.fetchone()
-                return row[0] if row else None
-
-    @staticmethod
-    async def get_all_last_messages() -> Dict[str, Dict[str, Any]]:
-        """Получение ID последних сообщений для всех каналов"""
-        async with DatabaseConnectionPool.get_connection() as db:
-            async with db.execute(
-                "SELECT channel_id, message_id, timestamp FROM last_messages"
-            ) as cursor:
-                results = await cursor.fetchall()
-                return {row[0]: {"message_id": row[1], "timestamp": row[2]} for row in results}
-
-    @staticmethod
-    async def get_latest_message() -> tuple:
-        """Получение самого последнего сообщения из всех каналов"""
-        async with DatabaseConnectionPool.get_connection() as db:
-            async with db.execute(
-                "SELECT channel_id, message_id, timestamp FROM last_messages ORDER BY timestamp DESC LIMIT 1"
-            ) as cursor:
-                row = await cursor.fetchone()
-                if row:
-                    return (row[0], row[1])  # (channel_id, message_id)
-                return (None, None)
-
-    @staticmethod
-    async def save_pinned_message(chat_id: str, message_id: int) -> None:
-        """Сохранение ID закрепленного сообщения для чата"""
-        async with DatabaseConnectionPool.get_connection() as db:
-            await db.execute(
-                """
-                INSERT OR REPLACE INTO pinned_messages 
-                (chat_id, message_id, timestamp) 
-                VALUES (?, ?, CURRENT_TIMESTAMP)
-                """,
-                (chat_id, message_id)
-            )
-            await db.commit()
-
-    @staticmethod
-    async def get_pinned_message(chat_id: str) -> Optional[int]:
-        """Получение ID закрепленного сообщения для чата"""
-        async with DatabaseConnectionPool.get_connection() as db:
-            async with db.execute(
-                "SELECT message_id FROM pinned_messages WHERE chat_id = ?",
-                (chat_id,)
-            ) as cursor:
-                row = await cursor.fetchone()
-                return row[0] if row else None
-
-    @staticmethod
-    async def get_all_pinned_messages() -> Dict[str, int]:
-        """Получение всех закрепленных сообщений"""
-        async with DatabaseConnectionPool.get_connection() as db:
-            async with db.execute(
-                "SELECT chat_id, message_id FROM pinned_messages"
-            ) as cursor:
-                results = await cursor.fetchall()
-                return {row[0]: row[1] for row in results}
-
-    @staticmethod
-    async def delete_pinned_message(chat_id: str) -> None:
-        """Удаление записи о закрепленном сообщении"""
-        async with DatabaseConnectionPool.get_connection() as db:
-            await db.execute(
-                "DELETE FROM pinned_messages WHERE chat_id = ?",
-                (chat_id,)
-            )
-            await db.commit()
 
 # Update the main function to handle cleanup
 async def main():
-    """Main entry point with improved error handling"""
+    """Main entry point with improved error handling and resource cleanup"""
     lock_file = "bot.lock"
     bot = None
     
@@ -1959,15 +1772,33 @@ async def main():
 
         bot = ForwarderBot()
         await bot.start()
+    except asyncio.CancelledError:
+        logger.info("Main task was cancelled")
+    except KeyboardInterrupt:
+        logger.info("Received keyboard interrupt")
+    except Exception as e:
+        logger.error(f"Bot stopped due to error: {e}")
+        import traceback
+        logger.error(f"Traceback: {traceback.format_exc()}")
     finally:
+        logger.info("Starting cleanup process...")
         try:
             if bot:
+                logger.info("Cleaning up bot resources...")
                 await bot.cleanup()  # Stop all child bots
+            
+            logger.info("Closing database connections...")
             await Repository.close_db()
+            
             if os.path.exists(lock_file):
+                logger.info("Removing lock file...")
                 os.remove(lock_file)
+                
+            logger.info("Cleanup completed successfully")
         except Exception as e:
             logger.error(f"Error during cleanup: {e}")
+            import traceback
+            logger.error(f"Cleanup traceback: {traceback.format_exc()}")
 
 # Main entry point with proper Windows multiprocessing support
 if __name__ == "__main__":
