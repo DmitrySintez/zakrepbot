@@ -25,26 +25,6 @@ class BotState(ABC):
         """Handle message forwarding"""
         pass
 
-class IdleState(BotState):
-    """State when bot is not forwarding messages"""
-    
-    def __init__(self, bot_context, auto_forward: bool = False):
-        self.context = bot_context
-        self.auto_forward = auto_forward
-    
-    async def start(self) -> None:
-        interval = int(await Repository.get_config("repost_interval", "3600"))
-        self.context.state = RunningState(self.context, interval, self.auto_forward)
-        await self.context._notify_admins("Бот начал пересылку")
-    
-    async def stop(self) -> None:
-        # Already stopped
-        pass
-    
-    async def handle_message(self, channel_id: str, message_id: int) -> None:
-        # Don't forward messages in idle state
-        logger.info("Bot is idle, not forwarding messages")
-
 class IdleState:
     """Состояние, когда бот не пересылает сообщения"""
     
@@ -69,18 +49,17 @@ class IdleState:
         await Repository.save_last_message(channel_id, message_id)
         logger.info(f"Сохранено сообщение {message_id} из канала {channel_id} (бот остановлен)")
         
-class RunningState:
+class RunningState(BotState):
     """Состояние, когда бот активно пересылает и закрепляет сообщения с ротацией между каналами"""
     
-    def __init__(self, bot_context, interval: int):
+    def __init__(self, bot_context, interval: int, auto_forward: bool = False):
         self.context = bot_context
-        self.interval = interval  # Интервал ротации в секундах (например, 7200 = 2 часа)
+        self.interval = interval
         self._rotation_task = None
-        
-        # Индекс текущего канала для ротации
+        self.auto_forward = auto_forward
+        if not hasattr(self.context, '_last_pinned'):
+            self.context._last_pinned = {}
         self._current_channel_index = 0
-        
-        # Запускаем задачу ротации
         self._start_rotation_task()
         
     async def find_latest_message(self, channel_id: str) -> Optional[int]:
@@ -92,7 +71,48 @@ class RunningState:
         """Запуск задачи ротации каналов"""
         if not self._rotation_task or self._rotation_task.done():
             self._rotation_task = asyncio.create_task(self._channel_rotation())
-            
+    async def forward_and_pin_message(self, channel_id: str, message_id: int) -> bool:
+        current_channel_idx = 0
+        target_chats = await Repository.get_target_chats()
+        if not target_chats:
+            logger.warning("Нет целевых чатов для пересылки")
+            return
+        while True:
+            try:
+                channel_id = self.context.config.source_channels[current_channel_idx]
+                last_msg_id = await Repository.get_last_message(channel_id)
+                if not last_msg_id:
+                    current_channel_idx = (current_channel_idx + 1) % len(self.context.config.source_channels)
+                    await asyncio.sleep(self.interval)
+                    continue
+
+                for chat_id in target_chats:
+                    prev_pinned = self.context._last_pinned.get(chat_id)
+                    if prev_pinned:
+                        try:
+                            await self.context.bot.unpin_chat_message(chat_id, prev_pinned)
+                        except Exception:
+                            pass
+
+                    fwd = await self.context.bot.forward_message(
+                        chat_id=chat_id,
+                        from_chat_id=channel_id,
+                        message_id=last_msg_id
+                    )
+
+                    try:
+                        await self.context.bot.pin_chat_message(chat_id, fwd.message_id)
+                        self.context._last_pinned[chat_id] = fwd.message_id
+                    except Exception:
+                        pass
+
+                current_channel_idx = (current_channel_idx + 1) % len(self.context.config.source_channels)
+                await asyncio.sleep(self.interval)
+
+            except Exception as e:
+                logger.error(f"Ошибка: {e}")
+                await asyncio.sleep(60)
+     
     def update_interval(self, new_interval: int):
         """Обновление интервала ротации"""
         logger.info(f"Обновление интервала ротации с {self.interval} на {new_interval} секунд")
@@ -251,66 +271,46 @@ class BotContext:
         return await self.state._rotate_to_next_channel()
     
     async def forward_and_pin_message(self, channel_id: str, message_id: int) -> bool:
-        """Пересылает сообщение во все целевые чаты и закрепляет его"""
-        success = False
+        current_channel_idx = 0
         target_chats = await Repository.get_target_chats()
-        
         if not target_chats:
             logger.warning("Нет целевых чатов для пересылки")
-            return False
-
-        for chat_id in target_chats:
-            if str(chat_id) == channel_id:
-                logger.info(f"Пропускаю пересылку в исходный канал {chat_id}")
-                continue
-                
+            return
+        while True:
             try:
-                # Получаем информацию о чате
-                chat_info = await self.bot.get_chat(chat_id)
-                
-                # Проверяем, что это не канал (в каналах нельзя закреплять сообщения с помощью бота)
-                if chat_info.type == 'channel':
-                    logger.info(f"Пропускаю пересылку с закреплением в канал {chat_id} (только группы/супергруппы поддерживаются)")
+                channel_id = self.context.config.source_channels[current_channel_idx]
+                last_msg_id = await Repository.get_last_message(channel_id)
+                if not last_msg_id:
+                    current_channel_idx = (current_channel_idx + 1) % len(self.context.config.source_channels)
+                    await asyncio.sleep(self.interval)
                     continue
-                
-                # Пересылаем сообщение
-                forwarded_message = await self.bot.forward_message(
-                    chat_id=chat_id,
-                    from_chat_id=channel_id,
-                    message_id=message_id
-                )
-                
-                # Открепляем предыдущее сообщение, если оно есть
-                old_pinned_id = await Repository.get_pinned_message(str(chat_id))
-                if old_pinned_id:
-                    try:
-                        await self.bot.unpin_chat_message(
-                            chat_id=chat_id,
-                            message_id=old_pinned_id
-                        )
-                        logger.info(f"Откреплено предыдущее сообщение {old_pinned_id} в чате {chat_id}")
-                    except Exception as e:
-                        logger.warning(f"Не удалось открепить предыдущее сообщение {old_pinned_id} в чате {chat_id}: {e}")
-                
-                # Закрепляем новое сообщение
-                await self.bot.pin_chat_message(
-                    chat_id=chat_id,
-                    message_id=forwarded_message.message_id,
-                    disable_notification=True
-                )
-                
-                # Сохраняем ID закрепленного сообщения
-                await Repository.save_pinned_message(str(chat_id), forwarded_message.message_id)
-                
-                # Логируем статистику
-                await Repository.log_forward(message_id)
-                success = True
-                logger.info(f"Сообщение {message_id} переслано и закреплено в чате {chat_id}")
-            except Exception as e:
-                logger.error(f"Ошибка при пересылке/закреплении в {chat_id}: {e}")
 
-        return success
-    
+                for chat_id in target_chats:
+                    prev_pinned = self.context._last_pinned.get(chat_id)
+                    if prev_pinned:
+                        try:
+                            await self.context.bot.unpin_chat_message(chat_id, prev_pinned)
+                        except Exception:
+                            pass
+
+                    fwd = await self.context.bot.forward_message(
+                        chat_id=chat_id,
+                        from_chat_id=channel_id,
+                        message_id=last_msg_id
+                    )
+
+                    try:
+                        await self.context.bot.pin_chat_message(chat_id, fwd.message_id)
+                        self.context._last_pinned[chat_id] = fwd.message_id
+                    except Exception:
+                        pass
+
+                current_channel_idx = (current_channel_idx + 1) % len(self.context.config.source_channels)
+                await asyncio.sleep(self.interval)
+
+            except Exception as e:
+                logger.error(f"Ошибка: {e}")
+                await asyncio.sleep(60)
     async def _notify_admins(self, message: str):
         """Отправка уведомления всем администраторам бота"""
         for admin_id in self.config.admin_ids:

@@ -694,6 +694,10 @@ class ForwarderBot(CacheObserver):
                 lambda message: hasattr(self, 'awaiting_clone_token') and 
                 self.awaiting_clone_token == message.from_user.id
             )
+        self.dp.callback_query.register(self.set_interval_prompt, lambda c: c.data == "set_interval")
+        self.dp.callback_query.register(self.set_interval_submit, lambda c: c.data.startswith("set_interval_value_"))
+        self.dp.callback_query.register(self.set_interval_value, lambda c: c.data.startswith("set_interval_value_"))
+
         # Регистрируем обработчики с определенным порядком, чтобы избежать конфликтов
         for prefix, handler in callbacks.items():
             self.dp.callback_query.register(
@@ -716,7 +720,35 @@ class ForwarderBot(CacheObserver):
         
         return await self.state._rotate_to_next_channel()
 
-    
+    async def set_interval_value(self, callback: types.CallbackQuery):
+        if not self.is_admin(callback.from_user.id):
+            return
+
+        # Разбираем callback_data: set_interval_value_3600
+        parts = callback.data.split('_')
+        if len(parts) != 4:
+            await callback.answer("Неверный формат данных")
+            return
+
+        try:
+            interval = int(parts[3])
+            await Repository.set_config("rotation_interval", str(interval))
+            if isinstance(self.context.state, RunningState):
+                self.context.state.update_interval(interval)
+
+            await callback.message.edit_text(
+                f"✅ Интервал ротации установлен на {interval//60} минут.",
+                reply_markup=self.keyboard_factory.create_main_keyboard(
+                    isinstance(self.context.state, RunningState)
+                )
+            )
+            logger.info(f"Интервал обновлён на {interval} сек.")
+        except Exception as e:
+            await callback.answer("Ошибка при установке интервала")
+            logger.error(f"Ошибка установки интервала: {e}")
+
+        await callback.answer()
+
     async def forward_now_handler(self, callback: types.CallbackQuery):
         """Обработчик для кнопки немедленной ротации"""
         if not self.is_admin(callback.from_user.id):
@@ -897,53 +929,6 @@ class ForwarderBot(CacheObserver):
             # Если это ошибка "message is not modified", просто игнорируем её
             if "message is not modified" not in str(e):
                 logger.error(f"Ошибка при обновлении сообщения: {e}")
-        
-        await callback.answer()
-
-    async def set_interval_value(self, callback: types.CallbackQuery):
-        """Обработчик для установки интервала ротации"""
-        if not self.is_admin(callback.from_user.id):
-            return
-        
-        # Парсим значение интервала из callback данных
-        parts = callback.data.split('_')
-        if len(parts) != 3:
-            await callback.answer("Неверный формат данных")
-            return
-            
-        try:
-            # Значение в секундах
-            interval = int(parts[2])
-            
-            # Сохраняем интервал в базе данных
-            await Repository.set_config("rotation_interval", str(interval))
-            
-            # Если бот работает, обновляем интервал
-            if isinstance(self.context.state, RunningState):
-                self.context.state.update_interval(interval)
-                
-            # Форматируем интервал для отображения
-            if interval >= 3600:
-                hours = interval // 3600
-                minutes = (interval % 3600) // 60
-                display = f"{hours}ч"
-                if minutes > 0:
-                    display += f" {minutes}м"
-            else:
-                display = f"{interval // 60}м"
-                
-            await callback.message.edit_text(
-                f"✅ Интервал ротации установлен на {display}\n\n"
-                f"Бот будет пересылать и закреплять сообщения из каналов по очереди с этим интервалом.",
-                reply_markup=self.keyboard_factory.create_main_keyboard(
-                    isinstance(self.context.state, RunningState)
-                )
-            )
-            
-            logger.info(f"Установлен интервал ротации {interval} секунд ({interval//60} минут)")
-            
-        except ValueError:
-            await callback.answer("Ошибка при установке интервала")
         
         await callback.answer()
 
@@ -1648,65 +1633,47 @@ class BotContext:
     
     
     async def forward_and_pin_message(self, channel_id: str, message_id: int) -> bool:
-        """Пересылает сообщение во все целевые чаты и закрепляет его"""
-        success = False
+        current_channel_idx = 0
         target_chats = await Repository.get_target_chats()
-        
         if not target_chats:
             logger.warning("Нет целевых чатов для пересылки")
-            return False
-
-        for chat_id in target_chats:
-            if str(chat_id) == channel_id:
-                logger.info(f"Пропускаю пересылку в исходный канал {chat_id}")
-                continue
-                
+            return
+        while True:
             try:
-                # Получаем информацию о чате
-                chat_info = await self.bot.get_chat(chat_id)
-                
-                # Проверяем, что это не канал (в каналах нельзя закреплять сообщения с помощью бота)
-                if chat_info.type == 'channel':
-                    logger.info(f"Пропускаю пересылку с закреплением в канал {chat_id} (только группы/супергруппы поддерживаются)")
+                channel_id = self.config.source_channels[current_channel_idx]  # исправлено!
+                last_msg_id = await Repository.get_last_message(channel_id)
+                if not last_msg_id:
+                    current_channel_idx = (current_channel_idx + 1) % len(self.config.source_channels)
+                    await asyncio.sleep(self.interval)
                     continue
-                
-                # Пересылаем сообщение
-                forwarded_message = await self.bot.forward_message(
-                    chat_id=chat_id,
-                    from_chat_id=channel_id,
-                    message_id=message_id
-                )
-                
-                # Открепляем предыдущее сообщение, если оно есть
-                old_pinned_id = await Repository.get_pinned_message(str(chat_id))
-                if old_pinned_id:
-                    try:
-                        await self.bot.unpin_chat_message(
-                            chat_id=chat_id,
-                            message_id=old_pinned_id
-                        )
-                        logger.info(f"Откреплено предыдущее сообщение {old_pinned_id} в чате {chat_id}")
-                    except Exception as e:
-                        logger.warning(f"Не удалось открепить предыдущее сообщение {old_pinned_id} в чате {chat_id}: {e}")
-                
-                # Закрепляем новое сообщение
-                await self.bot.pin_chat_message(
-                    chat_id=chat_id,
-                    message_id=forwarded_message.message_id,
-                    disable_notification=True
-                )
-                
-                # Сохраняем ID закрепленного сообщения
-                await Repository.save_pinned_message(str(chat_id), forwarded_message.message_id)
-                
-                # Логируем статистику
-                await Repository.log_forward(message_id)
-                success = True
-                logger.info(f"Сообщение {message_id} переслано и закреплено в чате {chat_id}")
-            except Exception as e:
-                logger.error(f"Ошибка при пересылке/закреплении в {chat_id}: {e}")
 
-        return success
+                for chat_id in target_chats:
+                    prev_pinned = self._last_pinned.get(chat_id)  # исправлено!
+                    if prev_pinned:
+                        try:
+                            await self.bot.unpin_chat_message(chat_id, prev_pinned)  # исправлено!
+                        except Exception:
+                            pass
+
+                    fwd = await self.bot.forward_message(  # исправлено!
+                        chat_id=chat_id,
+                        from_chat_id=channel_id,
+                        message_id=last_msg_id
+                    )
+
+                    try:
+                        await self.bot.pin_chat_message(chat_id, fwd.message_id)  # исправлено!
+                        self._last_pinned[chat_id] = fwd.message_id
+                    except Exception:
+                        pass
+
+                current_channel_idx = (current_channel_idx + 1) % len(self.config.source_channels)
+                await asyncio.sleep(self.interval)
+
+            except Exception as e:
+                logger.error(f"Ошибка: {e}")
+                await asyncio.sleep(60)
+
 
     async def forward_latest_messages(self) -> bool:
         """Пересылает последние сообщения из всех каналов"""
