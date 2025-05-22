@@ -20,6 +20,7 @@ class KeyboardFactory:
         kb.button(text="👥 Управление клонами", callback_data="manage_clones")
         kb.button(text="💬 Список целевых чатов", callback_data="list_chats")
         kb.button(text="📌 Немедленная ротация", callback_data="forward_now")
+        kb.button(text="📅 Управление расписанием", callback_data="manage_schedule")  # Новая кнопка
         kb.adjust(2)
         return kb.as_markup()
 
