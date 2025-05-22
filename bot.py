@@ -790,10 +790,7 @@ class ForwarderBot(CacheObserver):
         )
         
         # Регистрация обработчика для ввода интервала вручную
-        self.dp.message.register(
-            self.set_interval_submit,
-            lambda message: message.from_user.id == self.awaiting_interval_input
-        )
+        
         
         # Регистрация прямой команды для добавления канала
         self.dp.message.register(
@@ -807,8 +804,6 @@ class ForwarderBot(CacheObserver):
         # Обработчики callback-запросов
         callbacks = {
             "toggle_forward": self.toggle_forwarding,
-            "set_interval": self.set_interval_prompt,
-            "set_interval_value_": self.set_interval_value,
             "add_channel_input": self.add_channel_input,
             "remove_channel_": self.remove_channel,
             "remove_": self.remove_chat,
@@ -816,7 +811,6 @@ class ForwarderBot(CacheObserver):
             "back_to_main": self.main_menu,
             "channels": self.manage_channels,
             "add_channel": self.add_channel_prompt,
-            "forward_now": self.forward_now_handler,
             "test_pin": self.test_pin_handler,
             "clone_bot": self.clone_bot_prompt,
             "clone_inline_": self.clone_bot_inline,
@@ -834,9 +828,7 @@ class ForwarderBot(CacheObserver):
                 lambda message: hasattr(self, 'awaiting_clone_token') and 
                 self.awaiting_clone_token == message.from_user.id
             )
-        self.dp.callback_query.register(self.set_interval_prompt, lambda c: c.data == "set_interval")
-        self.dp.callback_query.register(self.set_interval_value, lambda c: c.data.startswith("set_interval_value_"))
-        
+
         self.dp.callback_query.register(self.manage_schedule, lambda c: c.data == "manage_schedule")
         self.dp.callback_query.register(self.add_schedule_prompt, lambda c: c.data == "add_schedule")
         self.dp.callback_query.register(self.remove_schedule_prompt, lambda c: c.data == "remove_schedule")
@@ -899,95 +891,6 @@ class ForwarderBot(CacheObserver):
             return False
         
         return await self.state._rotate_to_next_channel()
-
-    async def set_interval_value(self, callback: types.CallbackQuery):
-        """Обработчик для выбора предустановленного интервала ротации каналов"""
-        if not self.is_admin(callback.from_user.id):
-            return
-
-        # Разбираем callback_data: set_interval_value_3600 или set_interval_value_custom
-        parts = callback.data.split('_')
-        if len(parts) != 4:
-            await callback.answer("Неверный формат данных")
-            return
-
-        # Обрабатываем выбор пользовательского интервала
-        if parts[3] == "custom":
-            self.awaiting_interval_input = callback.from_user.id
-            
-            kb = InlineKeyboardBuilder()
-            kb.button(text="Отмена", callback_data="set_interval")
-            
-            await callback.message.edit_text(
-                "Введите интервал в минутах (от 5 до 1440):\n\n"
-                "Например, для 1 часа введите: 60",
-                reply_markup=kb.as_markup()
-            )
-            await callback.answer()
-            return
-
-        try:
-            # Обрабатываем выбор предустановленного интервала
-            interval = int(parts[3])
-            await Repository.set_config("rotation_interval", str(interval))
-            
-            # Если бот запущен, обновляем интервал ротации
-            if isinstance(self.context.state, RunningState):
-                self.context.state.update_interval(interval)
-
-            # Форматируем интервал для отображения
-            if interval >= 3600:
-                hours = interval // 3600
-                remaining_minutes = (interval % 3600) // 60
-                display = f"{hours} ч"
-                if remaining_minutes > 0:
-                    display += f" {remaining_minutes} мин"
-            else:
-                display = f"{interval // 60} мин"
-            
-            await callback.message.edit_text(
-                f"✅ Интервал ротации установлен на {display}.",
-                reply_markup=self.keyboard_factory.create_main_keyboard(
-                    isinstance(self.context.state, RunningState)
-                )
-            )
-            logger.info(f"Интервал обновлён на {interval} сек.")
-        except Exception as e:
-            await callback.answer(f"Ошибка при установке интервала: {e}")
-            logger.error(f"Ошибка установки интервала: {e}")
-
-        await callback.answer()
-
-    async def forward_now_handler(self, callback: types.CallbackQuery):
-        """Обработчик для кнопки немедленной ротации"""
-        if not self.is_admin(callback.from_user.id):
-            return
-            
-        await callback.message.edit_text("🔄 Выполняю немедленную ротацию закрепленных сообщений...")
-        
-        if isinstance(self.context.state, RunningState):
-            success = await self.context.rotate_now()
-        else:
-            # Если бот не запущен, запускаем его и выполняем ротацию
-            await self.context.state.start()  # Запускаем бота
-            success = isinstance(self.context.state, RunningState)
-        
-        if success:
-            await callback.message.edit_text(
-                "✅ Ротация успешно выполнена. Сообщение переслано и закреплено.",
-                reply_markup=self.keyboard_factory.create_main_keyboard(
-                    isinstance(self.context.state, RunningState)
-                )
-            )
-        else:
-            await callback.message.edit_text(
-                "⚠️ Ошибка при выполнении ротации. Проверьте наличие каналов и целевых чатов.",
-                reply_markup=self.keyboard_factory.create_main_keyboard(
-                    isinstance(self.context.state, RunningState)
-                )
-            )
-        
-        await callback.answer()
 
     async def test_pin_handler(self, callback: types.CallbackQuery):
         """Обработчик для тестирования функции закрепления сообщений"""
@@ -1117,84 +1020,6 @@ class ForwarderBot(CacheObserver):
         )
         await callback.answer()
 
-    async def set_interval_prompt(self, callback: types.CallbackQuery):
-        """Окно установки интервала ротации каналов"""
-        if not self.is_admin(callback.from_user.id):
-            return
-            
-        current_interval = await Repository.get_config("rotation_interval", "7200")  # 2 часа по умолчанию
-        current_minutes = int(current_interval) // 60
-        
-        try:
-            await callback.message.edit_text(
-                f"⏱️ Интервал ротации каналов\n\n"
-                f"Текущий интервал: {current_minutes} мин.\n\n"
-                f"Выберите новый интервал ротации между каналами.\n"
-                f"Это время, через которое бот будет переключаться между каналами.",
-                reply_markup=KeyboardFactory.create_rotation_interval_keyboard()
-            )
-        except Exception as e:
-            # Обрабатываем ошибку при обновлении сообщения
-            # Если это ошибка "message is not modified", просто игнорируем её
-            if "message is not modified" not in str(e):
-                logger.error(f"Ошибка при обновлении сообщения: {e}")
-        
-        await callback.answer()
-
-    async def set_interval_submit(self, message: types.Message):
-        """Обработчик ручного ввода интервала"""
-        if not self.is_admin(message.from_user.id) or message.from_user.id != self.awaiting_interval_input:
-            return
-            
-        # Сбрасываем состояние ожидания
-        self.awaiting_interval_input = None
-        
-        try:
-            # Конвертируем ввод в минуты
-            minutes = int(message.text.strip())
-            
-            if minutes < 5:
-                await message.reply("⚠️ Интервал должен быть не менее 5 минут")
-                return
-                
-            if minutes > 1440:  # 24 часа
-                await message.reply("⚠️ Интервал не должен превышать 24 часа (1440 минут)")
-                return
-                
-            # Конвертируем в секунды для сохранения
-            interval = minutes * 60
-            
-            await Repository.set_config("rotation_interval", str(interval))
-            
-            # Если бот работает, обновляем интервал
-            if isinstance(self.context.state, RunningState):
-                self.context.state.update_interval(interval)
-                
-            # Форматируем интервал для отображения
-            if interval >= 3600:
-                hours = interval // 3600
-                remaining_minutes = (interval % 3600) // 60
-                display = f"{hours}ч"
-                if remaining_minutes > 0:
-                    display += f" {remaining_minutes}м"
-            else:
-                display = f"{minutes}м"
-                
-            kb = InlineKeyboardBuilder()
-            kb.button(text="Главное меню", callback_data="back_to_main")
-                
-            await message.reply(
-                f"✅ Интервал ротации установлен на {display}",
-                reply_markup=kb.as_markup()
-            )
-            
-            logger.info(f"Установлен интервал ротации {interval} секунд ({minutes} минут)")
-            
-        except ValueError:
-            await message.reply(
-                "❌ Ошибка: введите целое число минут\n"
-                "Например: 60 для интервала в 1 час"
-            )
 
     async def get_chat_info(self, bot: Bot, chat_id: int) -> Optional[ChatInfo]:
         """Get chat info from cache or fetch from API"""
@@ -1762,31 +1587,15 @@ class KeyboardFactory:
             text="🔄 Запустить ротацию" if not running else "⏹ Остановить ротацию",
             callback_data="toggle_forward"
         )
-        kb.button(text="⏱️ Установить интервал", callback_data="set_interval")
         kb.button(text="⚙️ Управление каналами", callback_data="channels")
         kb.button(text="🤖 Клонировать бота", callback_data="clone_bot")  # Добавить эту кнопку
         kb.button(text="👥 Управление клонами", callback_data="manage_clones")  # Добавить эту кнопку
         kb.button(text="💬 Список целевых чатов", callback_data="list_chats")
-        kb.button(text="📌 Немедленная ротация", callback_data="forward_now")
         kb.button(text="📅 Управление расписанием", callback_data="manage_schedule")  # Новая кнопка
         kb.adjust(2)
         return kb.as_markup()
 
-    @staticmethod
-    def create_rotation_interval_keyboard() -> Any:
-        """Создание клавиатуры выбора интервала ротации"""
-        kb = InlineKeyboardBuilder()
-        intervals = [
-            ("30м", 1800), ("1ч", 3600), ("2ч", 7200), 
-            ("3ч", 10800), ("6ч", 21600), ("12ч", 43200), 
-            ("24ч", 86400)
-        ]
-        for label, seconds in intervals:
-            kb.button(text=label, callback_data=f"set_interval_value_{seconds}")
-        kb.button(text="Другой...", callback_data="set_interval_value_custom")
-        kb.button(text="Назад", callback_data="back_to_main")
-        kb.adjust(4)
-        return kb.as_markup()
+    
 
     @staticmethod
     def create_chat_list_keyboard(chats: Dict[int, str]) -> Any:

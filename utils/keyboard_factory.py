@@ -14,30 +14,12 @@ class KeyboardFactory:
             text="🔄 Запустить ротацию" if not running else "⏹ Остановить ротацию",
             callback_data="toggle_forward"
         )
-        kb.button(text="⏱️ Установить интервал", callback_data="set_interval")
         kb.button(text="⚙️ Управление каналами", callback_data="channels")
         kb.button(text="🤖 Клонировать бота", callback_data="clone_bot")
         kb.button(text="👥 Управление клонами", callback_data="manage_clones")
         kb.button(text="💬 Список целевых чатов", callback_data="list_chats")
-        kb.button(text="📌 Немедленная ротация", callback_data="forward_now")
         kb.button(text="📅 Управление расписанием", callback_data="manage_schedule")  # Новая кнопка
         kb.adjust(2)
-        return kb.as_markup()
-
-    @staticmethod
-    def create_rotation_interval_keyboard() -> Any:
-        """Create interval selection keyboard for rotation"""
-        kb = InlineKeyboardBuilder()
-        intervals = [
-            ("30м", 1800), ("1ч", 3600), ("2ч", 7200), 
-            ("3ч", 10800), ("6ч", 21600), ("12ч", 43200), 
-            ("24ч", 86400)
-        ]
-        for label, seconds in intervals:
-            kb.button(text=label, callback_data=f"set_interval_value_{seconds}")
-        kb.button(text="Другой...", callback_data="set_interval_value_custom")
-        kb.button(text="Назад", callback_data="back_to_main")
-        kb.adjust(4)
         return kb.as_markup()
 
     @staticmethod
