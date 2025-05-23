@@ -34,7 +34,12 @@ class IdleState:
     async def start(self) -> None:
         """Запуск работы по расписанию"""
         self.context.state = RunningState(self.context)
-        await self.context._notify_admins("🚀 Бот запущен! Работа по расписанию активирована.")
+        # Уведомляем администраторов
+        for admin_id in self.context.config.admin_ids:
+            try:
+                await self.context.bot.send_message(admin_id, "🚀 Бот запущен! Работа по расписанию активирована.")
+            except Exception as e:
+                logger.error(f"Не удалось уведомить администратора {admin_id}: {e}")
     
     async def stop(self) -> None:
         pass
@@ -49,10 +54,12 @@ class RunningState(BotState):
     def __init__(self, bot_context, auto_forward: bool = True):
         self.context = bot_context
         self._schedule_task = None
-        self._current_channel = None
-        self._current_message_id = None
+        self._current_active_channel = None  # Текущий активный канал
+        self._current_pinned_message = None  # ID текущего закрепленного сообщения
+        self._last_pin_time = None  # Время последнего закрепления
         self.auto_forward = auto_forward
         self._last_check_date = None
+        self._processed_slots = set()  # Отслеживание обработанных слотов в текущий день
         self._start_schedule_task()
     
     def _start_schedule_task(self):
@@ -71,40 +78,57 @@ class RunningState(BotState):
                 # Проверяем, сменился ли день
                 if self._last_check_date != current_date:
                     logger.info(f"📅 Новый день: {current_date}. Сброс состояния.")
-                    self._current_channel = None
-                    self._current_message_id = None
+                    self._current_active_channel = None
+                    self._current_pinned_message = None
+                    self._last_pin_time = None
+                    self._processed_slots.clear()  # Очищаем обработанные слоты
                     self._last_check_date = current_date
                 
-                active_channel = await self._get_active_channel()
+                # Получаем активный канал для текущего времени
+                active_channel_info = await self._get_active_channel_info()
                 
-                if active_channel:
-                    logger.debug(f"📺 Активный канал по расписанию: {active_channel}")
+                if active_channel_info:
+                    channel_id = active_channel_info["channel_id"]
+                    slot_id = active_channel_info["slot_id"]
                     
-                    # Получаем последнее сообщение из канала
-                    latest_message_id = await Repository.get_last_message(active_channel)
+                    logger.debug(f"📺 Активный канал по расписанию: {channel_id} (слот: {slot_id})")
                     
-                    if latest_message_id:
-                        # Проверяем, изменился ли канал или сообщение
-                        channel_changed = active_channel != self._current_channel
-                        message_changed = latest_message_id != self._current_message_id
+                    # Проверяем, обрабатывали ли мы уже этот слот сегодня
+                    if slot_id not in self._processed_slots:
+                        logger.info(f"🆕 Новый временной слот {slot_id} для канала {channel_id}")
                         
-                        if channel_changed or message_changed:
-                            logger.info(
-                                f"🔄 Обновление: канал {'изменился' if channel_changed else 'тот же'}, "
-                                f"сообщение {'новое' if message_changed else 'то же'}"
-                            )
-                            
+                        # Получаем последнее сообщение из канала
+                        latest_message_id = await Repository.get_last_message(channel_id)
+                        
+                        if latest_message_id:
                             # Пытаемся переслать и закрепить сообщение
-                            success = await self.context.forward_and_pin_message(active_channel, latest_message_id)
+                            success = await self.context.forward_and_pin_message(channel_id, latest_message_id)
                             
                             if success:
-                                self._current_channel = None
-                        self._current_message_id = None
-                    
-                    logger.debug(f"🕐 Нет активных каналов в {current_time}")
+                                self._current_active_channel = channel_id
+                                self._current_pinned_message = latest_message_id
+                                self._last_pin_time = datetime.now()
+                                self._processed_slots.add(slot_id)  # Отмечаем слот как обработанный
+                                
+                                logger.info(f"✅ Успешно обработан слот {slot_id} для канала {channel_id}")
+                            else:
+                                logger.error(f"❌ Не удалось обработать слот {slot_id} для канала {channel_id}")
+                        else:
+                            logger.warning(f"⚠️ Нет сохраненных сообщений для канала {channel_id}")
+                            # Отмечаем слот как обработанный, чтобы не пытаться снова
+                            self._processed_slots.add(slot_id)
+                    else:
+                        logger.debug(f"✅ Слот {slot_id} уже обработан сегодня")
+                else:
+                    # Если нет активного канала, сбрасываем текущее состояние
+                    if self._current_active_channel:
+                        logger.info(f"⏰ Время активности канала {self._current_active_channel} закончилось")
+                        self._current_active_channel = None
+                        self._current_pinned_message = None
+                        self._last_pin_time = None
                 
-                # Проверяем каждые 30 секунд для быстрой реакции на изменения
-                await asyncio.sleep(30)
+                # Проверяем каждые 60 секунд (достаточно для точности по минутам)
+                await asyncio.sleep(60)
                 
         except asyncio.CancelledError:
             logger.info("⏹️ Задача проверки расписания отменена")
@@ -117,19 +141,28 @@ class RunningState(BotState):
             if not self._schedule_task.cancelled():
                 self._start_schedule_task()
     
-    async def _get_active_channel(self) -> Optional[str]:
-        """Определение активного канала по расписанию"""
+    async def _get_active_channel_info(self) -> Optional[dict]:
+        """Определение активного канала по расписанию с уникальным ID слота"""
         try:
             schedules = await Repository.get_schedules()
             current_time = datetime.now().strftime("%H:%M")
             
-            for schedule in schedules:
+            for i, schedule in enumerate(schedules):
                 start_time = schedule["start_time"]
                 end_time = schedule["end_time"]
+                channel_id = schedule["channel_id"]
                 
                 if self._is_time_in_range(current_time, start_time, end_time):
-                    logger.debug(f"📍 Найден активный канал {schedule['channel_id']} для времени {current_time}")
-                    return schedule["channel_id"]
+                    # Создаем уникальный ID слота на основе канала и времени
+                    slot_id = f"{channel_id}_{start_time}_{end_time}"
+                    
+                    logger.debug(f"📍 Найден активный канал {channel_id} для времени {current_time} (слот: {slot_id})")
+                    return {
+                        "channel_id": channel_id,
+                        "slot_id": slot_id,
+                        "start_time": start_time,
+                        "end_time": end_time
+                    }
             
             return None
         except Exception as e:
@@ -174,7 +207,17 @@ class RunningState(BotState):
                         await Repository.delete_pinned_message(str(chat_id))
                         logger.info(f"📌 Откреплено сообщение {pinned_message_id} в чате {chat_id}")
                     except Exception as e:
-                        logger.error(f"❌ Не удалось открепить сообщение в чате {chat_id}: {e}")
+                        error_text = str(e).lower()
+                        if any(phrase in error_text for phrase in [
+                            "message to unpin not found",
+                            "message not found",
+                            "message_id_invalid"
+                        ]):
+                            # Сообщение уже не существует, просто удаляем запись из БД
+                            await Repository.delete_pinned_message(str(chat_id))
+                            logger.info(f"📌 Запись о закрепленном сообщении {pinned_message_id} удалена (сообщение не найдено)")
+                        else:
+                            logger.error(f"❌ Не удалось открепить сообщение в чате {chat_id}: {e}")
         except Exception as e:
             logger.error(f"❌ Ошибка при откреплении сообщений: {e}")
     
@@ -194,7 +237,13 @@ class RunningState(BotState):
         # Открепляем все сообщения при остановке
         await self._unpin_current_messages()
         
-        await self.context._notify_admins("⏹️ Бот остановлен. Работа по расписанию деактивирована.")
+        # Уведомляем администраторов
+        for admin_id in self.context.config.admin_ids:
+            try:
+                await self.context.bot.send_message(admin_id, "⏹️ Бот остановлен. Работа по расписанию деактивирована.")
+            except Exception as e:
+                logger.error(f"Не удалось уведомить администратора {admin_id}: {e}")
+        
         self.context.state = IdleState(self.context)
     
     async def handle_message(self, channel_id: str, message_id: int) -> None:
@@ -203,33 +252,33 @@ class RunningState(BotState):
         logger.info(f"💾 Сохранено новое сообщение {message_id} из канала {channel_id}")
         
         # Проверяем, активен ли этот канал сейчас
-        if await self._is_channel_active(channel_id):
-            success = await self.context.forward_and_pin_message(channel_id, message_id)
-            if success:
-                self._current_message_id = message_id
-                logger.info(f"📌 Новое сообщение {message_id} из активного канала {channel_id} переслано и закреплено")
+        active_channel_info = await self._get_active_channel_info()
+        if active_channel_info and active_channel_info["channel_id"] == channel_id:
+            # Если канал активен, но слот уже был обработан, обновляем сообщение
+            slot_id = active_channel_info["slot_id"]
+            
+            if slot_id in self._processed_slots:
+                logger.info(f"🔄 Обновление сообщения в активном слоте {slot_id}")
+                
+                success = await self.context.forward_and_pin_message(channel_id, message_id)
+                if success:
+                    self._current_pinned_message = message_id
+                    logger.info(f"📌 Обновлено закрепленное сообщение {message_id} из активного канала {channel_id}")
+                else:
+                    logger.warning(f"⚠️ Не удалось обновить сообщение {message_id} из канала {channel_id}")
             else:
-                logger.warning(f"⚠️ Не удалось переслать новое сообщение {message_id} из канала {channel_id}")
+                # Если слот еще не был обработан, отмечаем его как обработанный
+                success = await self.context.forward_and_pin_message(channel_id, message_id)
+                if success:
+                    self._current_active_channel = channel_id
+                    self._current_pinned_message = message_id
+                    self._last_pin_time = datetime.now()
+                    self._processed_slots.add(slot_id)
+                    logger.info(f"📌 Новое сообщение {message_id} из активного канала {channel_id} переслано и закреплено")
+                else:
+                    logger.warning(f"⚠️ Не удалось переслать новое сообщение {message_id} из канала {channel_id}")
         else:
             logger.info(f"ℹ️ Канал {channel_id} не активен по расписанию, сообщение только сохранено")
-    
-    async def _is_channel_active(self, channel_id: str) -> bool:
-        """Проверка, активен ли канал в данный момент"""
-        try:
-            schedules = await Repository.get_schedules()
-            current_time = datetime.now().strftime("%H:%M")
-            
-            for schedule in schedules:
-                if schedule["channel_id"] == channel_id:
-                    start_time = schedule["start_time"]
-                    end_time = schedule["end_time"]
-                    
-                    if self._is_time_in_range(current_time, start_time, end_time):
-                        return True
-            return False
-        except Exception as e:
-            logger.error(f"❌ Ошибка при проверке активности канала {channel_id}: {e}")
-            return False
     
     async def find_latest_message(self, channel_id: str) -> Optional[int]:
         """Поиск последнего доступного сообщения в канале"""
@@ -268,7 +317,7 @@ class BotContext:
         return await self.state._rotate_to_next_channel()
     
     async def forward_and_pin_message(self, channel_id: str, message_id: int) -> bool:
-        """Пересылка и закрепление сообщений из канала во все целевые чаты с улучшенной обработкой ошибок"""
+        """Пересылка и закрепление сообщений из канала во все целевые чаты без пересылки админу для проверки"""
         try:
             target_chats = await Repository.get_target_chats()
             if not target_chats:
@@ -277,35 +326,6 @@ class BotContext:
             
             # Для отслеживания общего результата операции
             success = False
-            
-            # Сначала проверяем, существует ли сообщение в канале
-            try:
-                # Пытаемся получить информацию о сообщении, пересылая себе для проверки
-                await self.bot.forward_message(
-                    chat_id=self.config.owner_id,
-                    from_chat_id=channel_id,
-                    message_id=message_id
-                )
-                logger.debug(f"✅ Сообщение {message_id} из канала {channel_id} доступно")
-            except Exception as e:
-                logger.error(f"❌ Сообщение {message_id} недоступно в канале {channel_id}: {e}")
-                
-                # Пытаемся найти более новое сообщение
-                logger.info(f"🔍 Попытка найти более новое сообщение в канале {channel_id}")
-                try:
-                    from utils.message_utils import find_latest_message
-                    latest_message_id = await find_latest_message(self.bot, channel_id, self.config.owner_id, message_id)
-                    
-                    if latest_message_id and latest_message_id != message_id:
-                        logger.info(f"📨 Найдено более новое сообщение {latest_message_id} в канале {channel_id}")
-                        await Repository.save_last_message(channel_id, latest_message_id)
-                        message_id = latest_message_id
-                    else:
-                        logger.warning(f"⚠️ Не удалось найти новые сообщения в канале {channel_id}")
-                        return False
-                except Exception as find_error:
-                    logger.error(f"❌ Ошибка при поиске новых сообщений в канале {channel_id}: {find_error}")
-                    return False
             
             # Пересылаем сообщение во все целевые чаты
             for chat_id in target_chats:
@@ -355,7 +375,35 @@ class BotContext:
                             # Даже если не удалось закрепить, пересылка прошла успешно
                             success = True
                     except Exception as e:
-                        logger.error(f"❌ Не удалось переслать сообщение из канала {channel_id} в чат {chat_id}: {e}")
+                        # Если сообщение не может быть переслано (например, не существует)
+                        error_text = str(e).lower()
+                        if any(phrase in error_text for phrase in [
+                            "message not found", 
+                            "message to forward not found",
+                            "message_id_invalid"
+                        ]):
+                            logger.warning(f"⚠️ Сообщение {message_id} не найдено в канале {channel_id}")
+                            
+                            # Пытаемся найти более новое сообщение
+                            logger.info(f"🔍 Попытка найти более новое сообщение в канале {channel_id}")
+                            try:
+                                from utils.message_utils import find_latest_message
+                                latest_message_id = await find_latest_message(self.bot, channel_id, self.config.owner_id, message_id)
+                                
+                                if latest_message_id and latest_message_id != message_id:
+                                    logger.info(f"📨 Найдено более новое сообщение {latest_message_id} в канале {channel_id}")
+                                    await Repository.save_last_message(channel_id, latest_message_id)
+                                    
+                                    # Рекурсивно пробуем переслать новое сообщение
+                                    return await self.forward_and_pin_message(channel_id, latest_message_id)
+                                else:
+                                    logger.warning(f"⚠️ Не удалось найти новые сообщения в канале {channel_id}")
+                                    return False
+                            except Exception as find_error:
+                                logger.error(f"❌ Ошибка при поиске новых сообщений в канале {channel_id}: {find_error}")
+                                return False
+                        else:
+                            logger.error(f"❌ Не удалось переслать сообщение из канала {channel_id} в чат {chat_id}: {e}")
                 except Exception as e:
                     logger.error(f"❌ Ошибка при обработке чата {chat_id}: {e}")
             
@@ -366,6 +414,7 @@ class BotContext:
             import traceback
             logger.error(f"Traceback: {traceback.format_exc()}")
             return False
+    
     async def _notify_admins(self, message: str):
         """Отправка уведомления всем администраторам бота"""
         for admin_id in self.config.admin_ids:

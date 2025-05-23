@@ -7,11 +7,12 @@ from aiogram import Bot
 async def find_latest_message(bot: Bot, channel_id: str, owner_id: int, last_saved_id: Optional[int] = None) -> Optional[int]:
     """
     Универсальная функция для поиска последнего доступного сообщения в канале
+    БЕЗ пересылки сообщений админу для проверки
     
     Args:
         bot: Экземпляр бота
         channel_id: ID канала для поиска
-        owner_id: ID владельца бота (для тестирования пересылки)
+        owner_id: ID владельца бота (НЕ используется для пересылки)
         last_saved_id: Последний сохраненный ID сообщения (опционально)
     
     Returns:
@@ -43,12 +44,21 @@ async def find_latest_message(bot: Bot, channel_id: str, owner_id: int, last_sav
                 logger.info(f"⏳ Проверено {checked_count} сообщений (текущий ID: {msg_id})")
             
             try:
-                # Пытаемся переслать сообщение владельцу для проверки существования
-                msg = await bot.forward_message(
-                    chat_id=owner_id,
+                # Используем copy_message вместо forward_message для проверки существования
+                # copy_message не создает видимого сообщения для пользователя
+                test_msg = await bot.copy_message(
+                    chat_id=channel_id,  # Копируем в тот же канал
                     from_chat_id=channel_id,
-                    message_id=msg_id
+                    message_id=msg_id,
+                    disable_notification=True
                 )
+                
+                # Если копирование успешно, сообщение существует
+                # Сразу удаляем скопированное сообщение
+                try:
+                    await bot.delete_message(chat_id=channel_id, message_id=test_msg.message_id)
+                except:
+                    pass  # Игнорируем ошибки удаления
                 
                 logger.info(f"✅ Найдено новое сообщение {msg_id} в канале {channel_id}")
                 valid_id = msg_id
@@ -58,8 +68,9 @@ async def find_latest_message(bot: Bot, channel_id: str, owner_id: int, last_sav
                 error_text = str(e).lower()
                 if any(phrase in error_text for phrase in [
                     "message not found", 
-                    "message to forward not found",
-                    "message_id_invalid"
+                    "message to copy not found",
+                    "message_id_invalid",
+                    "message to forward not found"
                 ]):
                     # Сообщение не найдено, это нормально
                     continue
@@ -80,11 +91,19 @@ async def find_latest_message(bot: Bot, channel_id: str, owner_id: int, last_sav
                     logger.info(f"⏳ Проверено {checked_count} сообщений (текущий ID: {msg_id})")
                 
                 try:
-                    msg = await bot.forward_message(
-                        chat_id=owner_id,
+                    # Используем copy_message для проверки
+                    test_msg = await bot.copy_message(
+                        chat_id=channel_id,
                         from_chat_id=channel_id,
-                        message_id=msg_id
+                        message_id=msg_id,
+                        disable_notification=True
                     )
+                    
+                    # Удаляем скопированное сообщение
+                    try:
+                        await bot.delete_message(chat_id=channel_id, message_id=test_msg.message_id)
+                    except:
+                        pass
                     
                     logger.info(f"✅ Найдено сообщение {msg_id} в канале {channel_id}")
                     valid_id = msg_id
@@ -94,8 +113,9 @@ async def find_latest_message(bot: Bot, channel_id: str, owner_id: int, last_sav
                     error_text = str(e).lower()
                     if any(phrase in error_text for phrase in [
                         "message not found", 
-                        "message to forward not found",
-                        "message_id_invalid"
+                        "message to copy not found",
+                        "message_id_invalid",
+                        "message to forward not found"
                     ]):
                         continue
                     else:
@@ -115,3 +135,47 @@ async def find_latest_message(bot: Bot, channel_id: str, owner_id: int, last_sav
         import traceback
         logger.error(f"Traceback: {traceback.format_exc()}")
         return None
+
+
+async def check_message_exists(bot: Bot, channel_id: str, message_id: int) -> bool:
+    """
+    Проверка существования сообщения БЕЗ пересылки админу
+    
+    Args:
+        bot: Экземпляр бота
+        channel_id: ID канала
+        message_id: ID сообщения для проверки
+    
+    Returns:
+        True если сообщение существует, False если нет
+    """
+    try:
+        # Пробуем скопировать сообщение в тот же канал для проверки существования
+        test_msg = await bot.copy_message(
+            chat_id=channel_id,
+            from_chat_id=channel_id, 
+            message_id=message_id,
+            disable_notification=True
+        )
+        
+        # Если успешно скопировали, сразу удаляем копию
+        try:
+            await bot.delete_message(chat_id=channel_id, message_id=test_msg.message_id)
+        except:
+            pass  # Игнорируем ошибки удаления
+            
+        return True
+        
+    except Exception as e:
+        error_text = str(e).lower()
+        if any(phrase in error_text for phrase in [
+            "message not found",
+            "message to copy not found", 
+            "message_id_invalid",
+            "message to forward not found"
+        ]):
+            return False
+        else:
+            # Неожиданная ошибка
+            logger.warning(f"Неожиданная ошибка при проверке сообщения {message_id} в канале {channel_id}: {e}")
+            return False

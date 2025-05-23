@@ -212,7 +212,31 @@ class ForwarderBot(CacheObserver):
             "Введите время окончания (HH:MM):",
             reply_markup=kb.as_markup()
         )
-
+    async def safe_edit_message(self, callback: types.CallbackQuery, new_text: str, new_markup=None):
+        """Безопасное обновление сообщения с проверкой изменений"""
+        try:
+            current_text = callback.message.text or ""
+            
+            # Если текст отличается, обновляем сообщение
+            if current_text.strip() != new_text.strip():
+                if new_markup:
+                    await callback.message.edit_text(new_text, reply_markup=new_markup)
+                else:
+                    await callback.message.edit_text(new_text)
+            else:
+                # Если текст тот же, просто отвечаем на callback
+                await callback.answer()
+                
+        except Exception as e:
+            error_text = str(e).lower()
+            if "message is not modified" in error_text:
+                # Это нормальная ситуация, просто отвечаем на callback
+                await callback.answer()
+            else:
+                # Другая ошибка, логируем и отвечаем на callback
+                logger.warning(f"Не удалось обновить сообщение: {e}")
+                await callback.answer()
+            
     async def add_schedule_end_time_submit(self, message: types.Message):
         if not self.is_admin(message.from_user.id) or message.from_user.id != self.awaiting_end_time:
             return
@@ -240,32 +264,40 @@ class ForwarderBot(CacheObserver):
         self.awaiting_end_time = None
         self.temp_schedule = None
     async def remove_schedule_prompt(self, callback: types.CallbackQuery):
-        """Выбор слота для удаления"""
+        """Выбор слота для удаления с обработкой дублирования"""
         if not self.is_admin(callback.from_user.id):
             return
 
-        schedules = await Repository.get_schedules()
-        if not schedules:
+        try:
+            schedules = await Repository.get_schedules()
+            if not schedules:
+                kb = InlineKeyboardBuilder()
+                kb.button(text="◀️ Назад", callback_data="manage_schedule")
+                
+                text = "❌ Нет слотов для удаления."
+                
+                await self.safe_edit_message(callback, text, kb.as_markup())
+                return
+
+            text = "❌ Выберите слот для удаления:\n\n"
             kb = InlineKeyboardBuilder()
+            
+            for i, schedule in enumerate(schedules):
+                channel_name = await self._get_channel_name(schedule['channel_id'])
+                kb.button(
+                    text=f"🗑️ {channel_name} ({schedule['start_time']} - {schedule['end_time']})",
+                    callback_data=f"remove_slot_{i}"
+                )
+            
             kb.button(text="◀️ Назад", callback_data="manage_schedule")
-            await callback.message.edit_text("❌ Нет слотов для удаления.", reply_markup=kb.as_markup())
-            return
+            kb.adjust(1)
 
-        text = "❌ Выберите слот для удаления:\n\n"
-        kb = InlineKeyboardBuilder()
-        
-        for i, schedule in enumerate(schedules):
-            channel_name = await self._get_channel_name(schedule['channel_id'])
-            kb.button(
-                text=f"🗑️ {channel_name} ({schedule['start_time']} - {schedule['end_time']})",
-                callback_data=f"remove_slot_{i}"
-            )
-        
-        kb.button(text="◀️ Назад", callback_data="manage_schedule")
-        kb.adjust(1)
+            await self.safe_edit_message(callback, text, kb.as_markup())
+                
+        except Exception as e:
+            logger.error(f"Ошибка в remove_schedule_prompt: {e}")
+            await callback.answer(f"Ошибка: {e}")
 
-        await callback.message.edit_text(text, reply_markup=kb.as_markup())
-        await callback.answer()
 
     async def remove_schedule_confirm(self, callback: types.CallbackQuery):
         """Подтверждение удаления слота"""
@@ -884,79 +916,88 @@ class ForwarderBot(CacheObserver):
                 lambda c, p=prefix: c.data.startswith(p)
             )
     async def add_schedule_start(self, callback: types.CallbackQuery):
-        """Начало добавления расписания - выбор канала"""
+        """Начало добавления расписания - выбор канала с проверкой дублирования"""
         if not self.is_admin(callback.from_user.id):
             return
 
-        source_channels = self.config.source_channels
-        if not source_channels:
+        try:
+            source_channels = self.config.source_channels
+            if not source_channels:
+                kb = InlineKeyboardBuilder()
+                kb.button(text="◀️ Назад", callback_data="manage_schedule")
+                
+                text = ("⚠️ Нет настроенных исходных каналов.\n"
+                    "Сначала добавьте каналы в разделе 'Управление каналами'.")
+                
+                await self.safe_edit_message(callback, text, kb.as_markup())
+                return
+
+            text = "📡 Выберите канал для добавления в расписание:\n\n"
             kb = InlineKeyboardBuilder()
-            kb.button(text="◀️ Назад", callback_data="manage_schedule")
             
-            await callback.message.edit_text(
-                "⚠️ Нет настроенных исходных каналов.\n"
-                "Сначала добавьте каналы в разделе 'Управление каналами'.",
-                reply_markup=kb.as_markup()
-            )
-            return
+            for channel_id in source_channels:
+                channel_name = await self._get_channel_name(channel_id)
+                kb.button(
+                    text=f"📺 {channel_name}",
+                    callback_data=f"select_channel_{channel_id}"
+                )
+            
+            kb.button(text="◀️ Назад", callback_data="manage_schedule")
+            kb.adjust(1)
 
-        text = "📡 Выберите канал для добавления в расписание:\n\n"
-        kb = InlineKeyboardBuilder()
-        
-        for channel_id in source_channels:
-            channel_name = await self._get_channel_name(channel_id)
-            kb.button(
-                text=f"📺 {channel_name}",
-                callback_data=f"select_channel_{channel_id}"
-            )
-        
-        kb.button(text="◀️ Назад", callback_data="manage_schedule")
-        kb.adjust(1)
-
-        await callback.message.edit_text(text, reply_markup=kb.as_markup())
-        await callback.answer()    
+            await self.safe_edit_message(callback, text, kb.as_markup())
+                
+        except Exception as e:
+            logger.error(f"Ошибка в add_schedule_start: {e}")
+            await callback.answer(f"Ошибка: {e}")
     
     async def select_channel_for_schedule(self, callback: types.CallbackQuery):
-        """Выбор канала и переход к выбору времени"""
+        """Выбор канала и переход к выбору времени с обработкой дублирования"""
         if not self.is_admin(callback.from_user.id):
             return
 
-        channel_id = callback.data.replace("select_channel_", "")
-        self.temp_schedule_data = {"channel_id": channel_id}
-        
-        channel_name = await self._get_channel_name(channel_id)
-        
-        text = f"📺 Выбран канал: {channel_name}\n\n"
-        text += "⏰ Выберите временной интервал:\n\n"
-        
-        kb = InlineKeyboardBuilder()
-        
-        # Предустановленные интервалы по 2 часа
-        time_slots = [
-            ("🌅 06:00 - 08:00", "06:00", "08:00"),
-            ("🌄 08:00 - 10:00", "08:00", "10:00"),
-            ("🌞 10:00 - 12:00", "10:00", "12:00"),
-            ("☀️ 12:00 - 14:00", "12:00", "14:00"),
-            ("🌤️ 14:00 - 16:00", "14:00", "16:00"),
-            ("🌇 16:00 - 18:00", "16:00", "18:00"),
-            ("🌆 18:00 - 20:00", "18:00", "20:00"),
-            ("🌃 20:00 - 22:00", "20:00", "22:00"),
-            ("🌙 22:00 - 00:00", "22:00", "00:00"),
-            ("🦉 00:00 - 02:00", "00:00", "02:00"),
-        ]
-        
-        for display, start, end in time_slots:
-            kb.button(
-                text=display,
-                callback_data=f"set_time_{start}_{end}"
-            )
-        
-        kb.button(text="⚙️ Другое (ввести вручную)", callback_data="custom_time")
-        kb.button(text="◀️ Назад", callback_data="add_schedule_start")
-        kb.adjust(2)
+        try:
+            channel_id = callback.data.replace("select_channel_", "")
+            self.temp_schedule_data = {"channel_id": channel_id}
+            
+            channel_name = await self._get_channel_name(channel_id)
+            
+            text = f"📺 Выбран канал: {channel_name}\n\n"
+            text += "⏰ Выберите временной интервал:\n\n"
+            
+            kb = InlineKeyboardBuilder()
+            
+            # Предустановленные интервалы по 2 часа
+            time_slots = [
+                ("🌅 06:00 - 08:00", "06:00", "08:00"),
+                ("🌄 08:00 - 10:00", "08:00", "10:00"),
+                ("🌞 10:00 - 12:00", "10:00", "12:00"),
+                ("☀️ 12:00 - 14:00", "12:00", "14:00"),
+                ("🌤️ 14:00 - 16:00", "14:00", "16:00"),
+                ("🌇 16:00 - 18:00", "16:00", "18:00"),
+                ("🌆 18:00 - 20:00", "18:00", "20:00"),
+                ("🌃 20:00 - 22:00", "20:00", "22:00"),
+                ("🌙 22:00 - 00:00", "22:00", "00:00"),
+                ("🦉 00:00 - 02:00", "00:00", "02:00"),
+            ]
+            
+            for display, start, end in time_slots:
+                kb.button(
+                    text=display,
+                    callback_data=f"set_time_{start}_{end}"
+                )
+            
+            kb.button(text="⚙️ Другое (ввести вручную)", callback_data="custom_time")
+            kb.button(text="◀️ Назад", callback_data="add_schedule_start")
+            kb.adjust(2)
 
-        await callback.message.edit_text(text, reply_markup=kb.as_markup())
-        await callback.answer()
+            await callback.message.edit_text(text, reply_markup=kb.as_markup())
+            await callback.answer()
+            
+        except Exception as e:
+            logger.error(f"Ошибка в select_channel_for_schedule: {e}")
+            await callback.answer(f"Ошибка: {e}")
+
 
     async def set_predefined_time(self, callback: types.CallbackQuery):
         """Установка предустановленного времени"""
@@ -1123,31 +1164,35 @@ class ForwarderBot(CacheObserver):
 
 
     async def manage_schedule(self, callback: types.CallbackQuery):
-        """Управление расписанием с улучшенным UI"""
+        """Управление расписанием с улучшенным UI и обработкой дублирования"""
         if not self.is_admin(callback.from_user.id):
             return
 
-        schedules = await Repository.get_schedules()
-        text = "📅 Управление расписанием закрепления сообщений\n\n"
-        
-        if not schedules:
-            text += "🔴 Нет настроенных временных слотов.\n\n"
-        else:
-            text += "✅ Активные временные слоты:\n"
-            for i, schedule in enumerate(schedules, 1):
-                channel_name = await self._get_channel_name(schedule['channel_id'])
-                text += f"{i}. {channel_name}\n   🕐 {schedule['start_time']} - {schedule['end_time']}\n\n"
+        try:
+            schedules = await Repository.get_schedules()
+            text = "📅 Управление расписанием закрепления сообщений\n\n"
+            
+            if not schedules:
+                text += "🔴 Нет настроенных временных слотов.\n\n"
+            else:
+                text += "✅ Активные временные слоты:\n"
+                for i, schedule in enumerate(schedules, 1):
+                    channel_name = await self._get_channel_name(schedule['channel_id'])
+                    text += f"{i}. {channel_name}\n   🕐 {schedule['start_time']} - {schedule['end_time']}\n\n"
 
-        kb = InlineKeyboardBuilder()
-        kb.button(text="➕ Добавить новый слот", callback_data="add_schedule_start")
-        if schedules:
-            kb.button(text="❌ Удалить слот", callback_data="remove_schedule")
-        kb.button(text="🔄 Обновить расписание", callback_data="manage_schedule")
-        kb.button(text="◀️ Назад", callback_data="back_to_main")
-        kb.adjust(1)
+            kb = InlineKeyboardBuilder()
+            kb.button(text="➕ Добавить новый слот", callback_data="add_schedule_start")
+            if schedules:
+                kb.button(text="❌ Удалить слот", callback_data="remove_schedule")
+            kb.button(text="◀️ Назад", callback_data="back_to_main")
+            kb.adjust(1)
 
-        await callback.message.edit_text(text, reply_markup=kb.as_markup())
-        await callback.answer()
+            await self.safe_edit_message(callback, text, kb.as_markup())
+                
+        except Exception as e:
+            logger.error(f"Ошибка в manage_schedule: {e}")
+            await callback.answer(f"Ошибка: {e}")
+
     async def _start_rotation_task(self, interval: int = 7200) -> None:
             """Запускает ротацию закрепленных сообщений с указанным интервалом"""
             self.state = RunningState(self, interval)
@@ -1596,20 +1641,22 @@ class ForwarderBot(CacheObserver):
         await callback.answer()
 
     async def main_menu(self, callback: types.CallbackQuery):
-        """Обработчик кнопки главного меню"""
+        """Обработчик кнопки главного меню с защитой от дублирования"""
         if not self.is_admin(callback.from_user.id):
             return
         
-        await callback.message.edit_text(
-            "Главное меню:",
-            reply_markup=KeyboardFactory.create_main_keyboard(
+        try:
+            text = "Главное меню:"
+            markup = KeyboardFactory.create_main_keyboard(
                 isinstance(self.context.state, RunningState),
             )
-        )
-        await callback.answer()
-
+            
+            await self.safe_edit_message(callback, text, markup)
+        except Exception as e:
+            logger.error(f"Ошибка в main_menu: {e}")
+            await callback.answer(f"Ошибка: {e}")
     async def manage_channels(self, callback: types.CallbackQuery):
-        """Меню управления каналами"""
+        """Меню управления каналами с защитой от дублирования"""
         if not self.is_admin(callback.from_user.id):
             return
                 
@@ -1652,8 +1699,7 @@ class ForwarderBot(CacheObserver):
         # Используем KeyboardFactory для создания клавиатуры управления
         markup = KeyboardFactory.create_channel_management_keyboard(source_channels)
         
-        await callback.message.edit_text(text, reply_markup=markup)
-        await callback.answer()
+        await self.safe_edit_message(callback, text, markup)
 
     async def remove_channel(self, callback: types.CallbackQuery):
         """Удаление исходного канала"""
@@ -1931,7 +1977,7 @@ class BotContext:
     
     
     async def forward_and_pin_message(self, channel_id: str, message_id: int) -> bool:
-        """Пересылка и закрепление сообщений из канала во все целевые чаты с улучшенной обработкой ошибок"""
+        """Пересылка и закрепление сообщений из канала во все целевые чаты без пересылки админу для проверки"""
         try:
             target_chats = await Repository.get_target_chats()
             if not target_chats:
@@ -1940,35 +1986,6 @@ class BotContext:
             
             # Для отслеживания общего результата операции
             success = False
-            
-            # Сначала проверяем, существует ли сообщение в канале
-            try:
-                # Пытаемся получить информацию о сообщении, пересылая себе для проверки
-                await self.bot.forward_message(
-                    chat_id=self.config.owner_id,
-                    from_chat_id=channel_id,
-                    message_id=message_id
-                )
-                logger.debug(f"✅ Сообщение {message_id} из канала {channel_id} доступно")
-            except Exception as e:
-                logger.error(f"❌ Сообщение {message_id} недоступно в канале {channel_id}: {e}")
-                
-                # Пытаемся найти более новое сообщение
-                logger.info(f"🔍 Попытка найти более новое сообщение в канале {channel_id}")
-                try:
-                    from utils.message_utils import find_latest_message
-                    latest_message_id = await find_latest_message(self.bot, channel_id, self.config.owner_id, message_id)
-                    
-                    if latest_message_id and latest_message_id != message_id:
-                        logger.info(f"📨 Найдено более новое сообщение {latest_message_id} в канале {channel_id}")
-                        await Repository.save_last_message(channel_id, latest_message_id)
-                        message_id = latest_message_id
-                    else:
-                        logger.warning(f"⚠️ Не удалось найти новые сообщения в канале {channel_id}")
-                        return False
-                except Exception as find_error:
-                    logger.error(f"❌ Ошибка при поиске новых сообщений в канале {channel_id}: {find_error}")
-                    return False
             
             # Пересылаем сообщение во все целевые чаты
             for chat_id in target_chats:
@@ -2018,7 +2035,35 @@ class BotContext:
                             # Даже если не удалось закрепить, пересылка прошла успешно
                             success = True
                     except Exception as e:
-                        logger.error(f"❌ Не удалось переслать сообщение из канала {channel_id} в чат {chat_id}: {e}")
+                        # Если сообщение не может быть переслано (например, не существует)
+                        error_text = str(e).lower()
+                        if any(phrase in error_text for phrase in [
+                            "message not found", 
+                            "message to forward not found",
+                            "message_id_invalid"
+                        ]):
+                            logger.warning(f"⚠️ Сообщение {message_id} не найдено в канале {channel_id}")
+                            
+                            # Пытаемся найти более новое сообщение
+                            logger.info(f"🔍 Попытка найти более новое сообщение в канале {channel_id}")
+                            try:
+                                from utils.message_utils import find_latest_message
+                                latest_message_id = await find_latest_message(self.bot, channel_id, self.config.owner_id, message_id)
+                                
+                                if latest_message_id and latest_message_id != message_id:
+                                    logger.info(f"📨 Найдено более новое сообщение {latest_message_id} в канале {channel_id}")
+                                    await Repository.save_last_message(channel_id, latest_message_id)
+                                    
+                                    # Рекурсивно пробуем переслать новое сообщение
+                                    return await self.forward_and_pin_message(channel_id, latest_message_id)
+                                else:
+                                    logger.warning(f"⚠️ Не удалось найти новые сообщения в канале {channel_id}")
+                                    return False
+                            except Exception as find_error:
+                                logger.error(f"❌ Ошибка при поиске новых сообщений в канале {channel_id}: {find_error}")
+                                return False
+                        else:
+                            logger.error(f"❌ Не удалось переслать сообщение из канала {channel_id} в чат {chat_id}: {e}")
                 except Exception as e:
                     logger.error(f"❌ Ошибка при обработке чата {chat_id}: {e}")
             
@@ -2071,14 +2116,6 @@ class BotContext:
         
         return success
             
-    async def _notify_admins(self, message: str):
-        """Отправка уведомления всем администраторам бота"""
-        for admin_id in self.config.admin_ids:
-            try:
-                await self.bot.send_message(admin_id, message)
-            except Exception as e:
-                logger.error(f"Не удалось уведомить администратора {admin_id}: {e}")
-
 # Update the main function to handle cleanup
 async def main():
     """Main entry point with improved error handling and resource cleanup"""
