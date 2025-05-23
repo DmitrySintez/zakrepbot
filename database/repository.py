@@ -113,38 +113,70 @@ class Repository:
         try:
             async with DatabaseConnectionPool.get_connection() as db:
                 await db.executescript("""
-                    -- Существующие таблицы (оставьте свои как есть)
+                    -- Конфигурация бота
                     CREATE TABLE IF NOT EXISTS config (
                         key TEXT PRIMARY KEY,
                         value TEXT
                     );
+                    
+                    -- Целевые чаты для пересылки
                     CREATE TABLE IF NOT EXISTS target_chats (
                         chat_id INTEGER PRIMARY KEY,
                         added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                     );
-                    -- ... (другие ваши таблицы)
                     
-                    -- Новая таблица для расписания
+                    -- Последние сообщения из каналов
+                    CREATE TABLE IF NOT EXISTS last_messages (
+                        channel_id TEXT PRIMARY KEY,
+                        message_id INTEGER NOT NULL,
+                        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    );
+                    
+                    -- Закрепленные сообщения в чатах
+                    CREATE TABLE IF NOT EXISTS pinned_messages (
+                        chat_id TEXT PRIMARY KEY,
+                        message_id INTEGER NOT NULL,
+                        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    );
+                    
+                    -- Статистика пересылок
+                    CREATE TABLE IF NOT EXISTS forward_stats (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        message_id INTEGER,
+                        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    );
+                    
+                    -- Интервалы между каналами (устаревшее, оставляем для совместимости)
+                    CREATE TABLE IF NOT EXISTS channel_intervals (
+                        channel_id TEXT PRIMARY KEY,
+                        next_channel_id TEXT,
+                        interval_seconds INTEGER
+                    );
+                    
+                    -- НОВАЯ ТАБЛИЦА: Расписание работы каналов
                     CREATE TABLE IF NOT EXISTS schedule (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        channel_id TEXT,
-                        start_time TEXT,  -- HH:MM
-                        end_time TEXT,    -- HH:MM
+                        channel_id TEXT NOT NULL,
+                        start_time TEXT NOT NULL,  -- HH:MM формат
+                        end_time TEXT NOT NULL,    -- HH:MM формат
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                         UNIQUE(channel_id, start_time, end_time)
                     );
                     
-                    -- Существующие индексы (если есть)
+                    -- Индексы для оптимизации
                     CREATE INDEX IF NOT EXISTS idx_forward_stats_timestamp ON forward_stats(timestamp);
-                    -- ... (другие ваши индексы)
+                    CREATE INDEX IF NOT EXISTS idx_last_messages_timestamp ON last_messages(timestamp);
+                    CREATE INDEX IF NOT EXISTS idx_schedule_times ON schedule(start_time, end_time);
+                    CREATE INDEX IF NOT EXISTS idx_schedule_channel ON schedule(channel_id);
                 """)
                 await db.commit()
-                logger.info("База данных инициализирована успешно")
+                logger.info("✅ База данных инициализирована успешно")
         except Exception as e:
-            logger.error(f"Ошибка при инициализации базы данных: {e}")
+            logger.error(f"❌ Ошибка при инициализации базы данных: {e}")
             raise
     @staticmethod
     async def add_schedule(channel_id: str, start_time: str, end_time: str) -> None:
-        """Add a schedule entry for a channel"""
+        """Добавить временной слот для канала"""
         try:
             async with DatabaseConnectionPool.get_connection() as db:
                 await db.execute(
@@ -152,27 +184,37 @@ class Repository:
                     (channel_id, start_time, end_time)
                 )
                 await db.commit()
-                logger.info(f"Добавлен временной слот для канала {channel_id}: {start_time}-{end_time}")
+                logger.info(f"✅ Добавлен временной слот для канала {channel_id}: {start_time}-{end_time}")
         except Exception as e:
-            logger.error(f"Ошибка при добавлении временного слота: {e}")
+            logger.error(f"❌ Ошибка при добавлении временного слота: {e}")
+            raise
 
     @staticmethod
     async def get_schedules() -> List[Dict[str, Any]]:
-        """Get all schedule entries"""
+        """Получить все временные слоты"""
         try:
             async with DatabaseConnectionPool.get_connection() as db:
                 async with db.execute(
-                    "SELECT channel_id, start_time, end_time FROM schedule"
+                    "SELECT channel_id, start_time, end_time FROM schedule ORDER BY start_time"
                 ) as cursor:
                     results = await cursor.fetchall()
-                    return [{"channel_id": row[0], "start_time": row[1], "end_time": row[2]} for row in results]
+                    schedules = [
+                        {
+                            "channel_id": row[0], 
+                            "start_time": row[1], 
+                            "end_time": row[2]
+                        } 
+                        for row in results
+                    ]
+                    logger.debug(f"📅 Получено {len(schedules)} временных слотов")
+                    return schedules
         except Exception as e:
-            logger.error(f"Ошибка при получении расписания: {e}")
+            logger.error(f"❌ Ошибка при получении расписания: {e}")
             return []
 
     @staticmethod
     async def remove_schedule(channel_id: str, start_time: str, end_time: str) -> None:
-        """Remove a schedule entry for a channel"""
+        """Удалить временной слот для канала"""
         try:
             async with DatabaseConnectionPool.get_connection() as db:
                 await db.execute(
@@ -180,12 +222,13 @@ class Repository:
                     (channel_id, start_time, end_time)
                 )
                 await db.commit()
-                logger.info(f"Удален временной слот для канала {channel_id}: {start_time}-{end_time}")
+                logger.info(f"✅ Удален временной слот для канала {channel_id}: {start_time}-{end_time}")
         except Exception as e:
-            logger.error(f"Ошибка при удалении временного слота: {e}")
+            logger.error(f"❌ Ошибка при удалении временного слота: {e}")
+            raise
     @staticmethod
     async def get_target_chats() -> List[int]:
-        """Get list of target chat IDs"""
+        """Получить список целевых ID чатов"""
         try:
             async with DatabaseConnectionPool.get_connection() as db:
                 async with db.execute("SELECT chat_id FROM target_chats") as cursor:

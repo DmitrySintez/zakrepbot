@@ -146,7 +146,9 @@ class ForwarderBot(CacheObserver):
         self.awaiting_clone_token = None  # Track if waiting for clone token
         # Словарь для хранения ID закрепленных сообщений в чатах
         self.pinned_messages = {}
-        
+        self.awaiting_custom_start_time = None
+        self.awaiting_custom_end_time = None
+        self.temp_schedule_data = {}
         # Add this line to create the keyboard factory
         self.keyboard_factory = KeyboardFactory()
         
@@ -238,53 +240,65 @@ class ForwarderBot(CacheObserver):
         self.awaiting_end_time = None
         self.temp_schedule = None
     async def remove_schedule_prompt(self, callback: types.CallbackQuery):
+        """Выбор слота для удаления"""
         if not self.is_admin(callback.from_user.id):
             return
 
         schedules = await Repository.get_schedules()
         if not schedules:
             kb = InlineKeyboardBuilder()
-            kb.button(text="Назад", callback_data="manage_schedule")
-            await callback.message.edit_text("Нет слотов для удаления.", reply_markup=kb.as_markup())
+            kb.button(text="◀️ Назад", callback_data="manage_schedule")
+            await callback.message.edit_text("❌ Нет слотов для удаления.", reply_markup=kb.as_markup())
             return
 
+        text = "❌ Выберите слот для удаления:\n\n"
         kb = InlineKeyboardBuilder()
+        
         for i, schedule in enumerate(schedules):
+            channel_name = await self._get_channel_name(schedule['channel_id'])
             kb.button(
-                text=f"{schedule['channel_id']}: {schedule['start_time']} - {schedule['end_time']}",
+                text=f"🗑️ {channel_name} ({schedule['start_time']} - {schedule['end_time']})",
                 callback_data=f"remove_slot_{i}"
             )
-        kb.button(text="Отмена", callback_data="manage_schedule")
+        
+        kb.button(text="◀️ Назад", callback_data="manage_schedule")
         kb.adjust(1)
 
-        await callback.message.edit_text("Выберите слот для удаления:", reply_markup=kb.as_markup())
+        await callback.message.edit_text(text, reply_markup=kb.as_markup())
         await callback.answer()
 
     async def remove_schedule_confirm(self, callback: types.CallbackQuery):
+        """Подтверждение удаления слота"""
         if not self.is_admin(callback.from_user.id):
             return
 
-        parts = callback.data.split("_")
-        if len(parts) != 3 or parts[0] != "remove" or parts[1] != "slot":
-            await callback.answer("Неверный формат данных")
-            return
+        try:
+            slot_index = int(callback.data.split("_")[2])
+            schedules = await Repository.get_schedules()
+            
+            if slot_index < 0 or slot_index >= len(schedules):
+                await callback.answer("❌ Неверный индекс слота")
+                return
 
-        slot_index = int(parts[2])
-        schedules = await Repository.get_schedules()
-        if slot_index < 0 or slot_index >= len(schedules):
-            await callback.answer("Неверный индекс слота")
-            return
+            slot = schedules[slot_index]
+            await Repository.remove_schedule(slot["channel_id"], slot["start_time"], slot["end_time"])
 
-        slot = schedules[slot_index]
-        await Repository.remove_schedule(slot["channel_id"], slot["start_time"], slot["end_time"])
+            channel_name = await self._get_channel_name(slot["channel_id"])
+            
+            kb = InlineKeyboardBuilder()
+            kb.button(text="✅ К расписанию", callback_data="manage_schedule")
 
-        kb = InlineKeyboardBuilder()
-        kb.button(text="Назад к расписанию", callback_data="manage_schedule")
-
-        await callback.message.edit_text(
-            f"✅ Слот удалён: канал {slot['channel_id']}, {slot['start_time']} - {slot['end_time']}",
-            reply_markup=kb.as_markup()
-        )
+            await callback.message.edit_text(
+                f"✅ Временной слот удалён!\n\n"
+                f"📺 Канал: {channel_name}\n"
+                f"⏰ Время: {slot['start_time']} - {slot['end_time']}",
+                reply_markup=kb.as_markup()
+            )
+            
+        except Exception as e:
+            logger.error(f"Ошибка при удалении слота: {e}")
+            await callback.answer(f"❌ Ошибка: {e}")
+        
         await callback.answer()
         
     def _validate_time(self, time_str: str) -> bool:
@@ -791,7 +805,17 @@ class ForwarderBot(CacheObserver):
         
         # Регистрация обработчика для ввода интервала вручную
         
-        
+        self.dp.message.register(
+            self.handle_custom_start_time,
+            lambda message: hasattr(self, 'awaiting_custom_start_time') and 
+            self.awaiting_custom_start_time == message.from_user.id
+        )
+
+        self.dp.message.register(
+            self.handle_custom_end_time,
+            lambda message: hasattr(self, 'awaiting_custom_end_time') and 
+            self.awaiting_custom_end_time == message.from_user.id
+        )
         # Регистрация прямой команды для добавления канала
         self.dp.message.register(
             self.add_channel_prompt,
@@ -819,9 +843,12 @@ class ForwarderBot(CacheObserver):
             "stop_clone_": self.stop_clone,
             "manage_clones": self.manage_clones,
             "manage_schedule": self.manage_schedule,
-            "add_schedule": self.add_schedule_prompt,
+            "add_schedule_start": self.add_schedule_start,
+            "select_channel_": self.select_channel_for_schedule,
+            "set_time_": self.set_predefined_time,
+            "custom_time": self.custom_time_start,
             "remove_schedule": self.remove_schedule_prompt,
-            "back_to_schedule": self.manage_schedule
+            "remove_slot_": self.remove_schedule_confirm,
         }
         self.dp.message.register(
             self.clone_bot_submit,
@@ -856,29 +883,271 @@ class ForwarderBot(CacheObserver):
                 handler,
                 lambda c, p=prefix: c.data.startswith(p)
             )
-        
-        # Обработчик для добавления бота в чаты
-    async def manage_schedule(self, callback: types.CallbackQuery):
+    async def add_schedule_start(self, callback: types.CallbackQuery):
+        """Начало добавления расписания - выбор канала"""
         if not self.is_admin(callback.from_user.id):
             return
 
-        schedules = await Repository.get_schedules()
-        text = "📅 Текущее расписание:\n\n"
-        if not schedules:
-            text += "Нет настроенных временных слотов.\n"
-        else:
-            for schedule in schedules:
-                text += f"• Канал: {schedule['channel_id']}, {schedule['start_time']} - {schedule['end_time']}\n"
+        source_channels = self.config.source_channels
+        if not source_channels:
+            kb = InlineKeyboardBuilder()
+            kb.button(text="◀️ Назад", callback_data="manage_schedule")
+            
+            await callback.message.edit_text(
+                "⚠️ Нет настроенных исходных каналов.\n"
+                "Сначала добавьте каналы в разделе 'Управление каналами'.",
+                reply_markup=kb.as_markup()
+            )
+            return
 
+        text = "📡 Выберите канал для добавления в расписание:\n\n"
         kb = InlineKeyboardBuilder()
-        kb.button(text="➕ Добавить слот", callback_data="add_schedule")
-        kb.button(text="❌ Удалить слот", callback_data="remove_schedule")
-        kb.button(text="Назад", callback_data="back_to_main")
+        
+        for channel_id in source_channels:
+            channel_name = await self._get_channel_name(channel_id)
+            kb.button(
+                text=f"📺 {channel_name}",
+                callback_data=f"select_channel_{channel_id}"
+            )
+        
+        kb.button(text="◀️ Назад", callback_data="manage_schedule")
         kb.adjust(1)
+
+        await callback.message.edit_text(text, reply_markup=kb.as_markup())
+        await callback.answer()    
+    
+    async def select_channel_for_schedule(self, callback: types.CallbackQuery):
+        """Выбор канала и переход к выбору времени"""
+        if not self.is_admin(callback.from_user.id):
+            return
+
+        channel_id = callback.data.replace("select_channel_", "")
+        self.temp_schedule_data = {"channel_id": channel_id}
+        
+        channel_name = await self._get_channel_name(channel_id)
+        
+        text = f"📺 Выбран канал: {channel_name}\n\n"
+        text += "⏰ Выберите временной интервал:\n\n"
+        
+        kb = InlineKeyboardBuilder()
+        
+        # Предустановленные интервалы по 2 часа
+        time_slots = [
+            ("🌅 06:00 - 08:00", "06:00", "08:00"),
+            ("🌄 08:00 - 10:00", "08:00", "10:00"),
+            ("🌞 10:00 - 12:00", "10:00", "12:00"),
+            ("☀️ 12:00 - 14:00", "12:00", "14:00"),
+            ("🌤️ 14:00 - 16:00", "14:00", "16:00"),
+            ("🌇 16:00 - 18:00", "16:00", "18:00"),
+            ("🌆 18:00 - 20:00", "18:00", "20:00"),
+            ("🌃 20:00 - 22:00", "20:00", "22:00"),
+            ("🌙 22:00 - 00:00", "22:00", "00:00"),
+            ("🦉 00:00 - 02:00", "00:00", "02:00"),
+        ]
+        
+        for display, start, end in time_slots:
+            kb.button(
+                text=display,
+                callback_data=f"set_time_{start}_{end}"
+            )
+        
+        kb.button(text="⚙️ Другое (ввести вручную)", callback_data="custom_time")
+        kb.button(text="◀️ Назад", callback_data="add_schedule_start")
+        kb.adjust(2)
 
         await callback.message.edit_text(text, reply_markup=kb.as_markup())
         await callback.answer()
 
+    async def set_predefined_time(self, callback: types.CallbackQuery):
+        """Установка предустановленного времени"""
+        if not self.is_admin(callback.from_user.id):
+            return
+
+        # Правильно парсим время из callback_data
+        callback_parts = callback.data.replace("set_time_", "").split("_")
+        if len(callback_parts) == 2:
+            start_time = callback_parts[0]
+            end_time = callback_parts[1]
+            await self._save_schedule(start_time, end_time, callback)
+        else:
+            await callback.answer("Ошибка в данных времени")
+
+    async def custom_time_start(self, callback: types.CallbackQuery):
+        """Начало ввода пользовательского времени"""
+        if not self.is_admin(callback.from_user.id):
+            return
+
+        self.awaiting_custom_start_time = callback.from_user.id
+        
+        kb = InlineKeyboardBuilder()
+        kb.button(text="❌ Отмена", callback_data="add_schedule_start")
+        
+        await callback.message.edit_text(
+            "⏰ Введите время начала в формате ЧЧ:ММ\n"
+            "Например: 14:00\n\n"
+            "Отправьте время сообщением 💬",
+            reply_markup=kb.as_markup()
+        )
+        await callback.answer()
+
+    async def handle_custom_start_time(self, message: types.Message):
+        """Обработка ввода времени начала"""
+        if not self.is_admin(message.from_user.id) or self.awaiting_custom_start_time != message.from_user.id:
+            return
+
+        start_time = message.text.strip()
+        if not self._validate_time(start_time):
+            await message.reply("⚠️ Неверный формат времени. Используйте формат ЧЧ:ММ (например, 14:00)")
+            return
+
+        self.temp_schedule_data["start_time"] = start_time
+        self.awaiting_custom_start_time = None
+        self.awaiting_custom_end_time = message.from_user.id
+
+        kb = InlineKeyboardBuilder()
+        kb.button(text="❌ Отмена", callback_data="add_schedule_start")
+        
+        await message.reply(
+            f"✅ Время начала: {start_time}\n\n"
+            "⏰ Теперь введите время окончания в формате ЧЧ:ММ\n"
+            "Например: 18:00\n\n"
+            "Отправьте время сообщением 💬",
+            reply_markup=kb.as_markup()
+        )
+
+    async def handle_custom_end_time(self, message: types.Message):
+        """Обработка ввода времени окончания"""
+        if not self.is_admin(message.from_user.id) or self.awaiting_custom_end_time != message.from_user.id:
+            return
+
+        end_time = message.text.strip()
+        if not self._validate_time(end_time):
+            await message.reply("⚠️ Неверный формат времени. Используйте формат ЧЧ:ММ (например, 18:00)")
+            return
+
+        self.awaiting_custom_end_time = None
+        await self._save_schedule(self.temp_schedule_data["start_time"], end_time, message)
+
+    async def _save_schedule(self, start_time: str, end_time: str, context):
+        """Сохранение расписания"""
+        try:
+            channel_id = self.temp_schedule_data["channel_id"]
+            
+            # Проверяем, не пересекается ли время с существующими слотами
+            existing_schedules = await Repository.get_schedules()
+            for schedule in existing_schedules:
+                if self._times_overlap(start_time, end_time, schedule['start_time'], schedule['end_time']):
+                    kb = InlineKeyboardBuilder()
+                    kb.button(text="◀️ Назад", callback_data="manage_schedule")
+                    
+                    error_text = (
+                        f"⚠️ Временной слот {start_time} - {end_time} пересекается с существующим:\n"
+                        f"{schedule['start_time']} - {schedule['end_time']}\n\n"
+                        "Выберите другое время."
+                    )
+                    
+                    if hasattr(context, 'message'):
+                        await context.message.edit_text(error_text, reply_markup=kb.as_markup())
+                    else:
+                        await context.reply(error_text, reply_markup=kb.as_markup())
+                    return
+
+            await Repository.add_schedule(channel_id, start_time, end_time)
+            
+            channel_name = await self._get_channel_name(channel_id)
+            
+            kb = InlineKeyboardBuilder()
+            kb.button(text="✅ К расписанию", callback_data="manage_schedule")
+            kb.button(text="➕ Добавить еще", callback_data="add_schedule_start")
+            kb.adjust(2)
+            
+            success_text = (
+                f"✅ Временной слот успешно добавлен!\n\n"
+                f"📺 Канал: {channel_name}\n"
+                f"⏰ Время: {start_time} - {end_time}\n\n"
+                f"Теперь в это время будут закрепляться сообщения из выбранного канала."
+            )
+            
+            if hasattr(context, 'message'):
+                await context.message.edit_text(success_text, reply_markup=kb.as_markup())
+            else:
+                await context.reply(success_text, reply_markup=kb.as_markup())
+            
+            self.temp_schedule_data = {}
+            
+        except Exception as e:
+            logger.error(f"Ошибка при сохранении расписания: {e}")
+            
+            kb = InlineKeyboardBuilder()
+            kb.button(text="◀️ Назад", callback_data="manage_schedule")
+            
+            error_text = f"❌ Ошибка при сохранении расписания: {e}"
+            
+            if hasattr(context, 'message'):
+                await context.message.edit_text(error_text, reply_markup=kb.as_markup())
+            else:
+                await context.reply(error_text, reply_markup=kb.as_markup())
+
+    async def _get_channel_name(self, channel_id: str) -> str:
+        """Получение имени канала"""
+        try:
+            chat = await self.bot.get_chat(channel_id)
+            return chat.title or f"Канал {channel_id}"
+        except Exception:
+            return f"Канал {channel_id}"
+
+    def _validate_time(self, time_str: str) -> bool:
+        """Валидация формата времени"""
+        try:
+            hours, minutes = map(int, time_str.split(":"))
+            return 0 <= hours < 24 and 0 <= minutes < 60
+        except (ValueError, AttributeError):
+            return False
+
+    def _times_overlap(self, start1: str, end1: str, start2: str, end2: str) -> bool:
+        """Проверка пересечения временных интервалов"""
+        def time_to_minutes(time_str):
+            h, m = map(int, time_str.split(':'))
+            return h * 60 + m
+        
+        s1, e1 = time_to_minutes(start1), time_to_minutes(end1)
+        s2, e2 = time_to_minutes(start2), time_to_minutes(end2)
+        
+        # Обработка переходов через полночь
+        if e1 < s1:  # первый интервал переходит через полночь
+            e1 += 24 * 60
+        if e2 < s2:  # второй интервал переходит через полночь
+            e2 += 24 * 60
+            
+        return not (e1 <= s2 or e2 <= s1)
+
+
+    async def manage_schedule(self, callback: types.CallbackQuery):
+        """Управление расписанием с улучшенным UI"""
+        if not self.is_admin(callback.from_user.id):
+            return
+
+        schedules = await Repository.get_schedules()
+        text = "📅 Управление расписанием закрепления сообщений\n\n"
+        
+        if not schedules:
+            text += "🔴 Нет настроенных временных слотов.\n\n"
+        else:
+            text += "✅ Активные временные слоты:\n"
+            for i, schedule in enumerate(schedules, 1):
+                channel_name = await self._get_channel_name(schedule['channel_id'])
+                text += f"{i}. {channel_name}\n   🕐 {schedule['start_time']} - {schedule['end_time']}\n\n"
+
+        kb = InlineKeyboardBuilder()
+        kb.button(text="➕ Добавить новый слот", callback_data="add_schedule_start")
+        if schedules:
+            kb.button(text="❌ Удалить слот", callback_data="remove_schedule")
+        kb.button(text="🔄 Обновить расписание", callback_data="manage_schedule")
+        kb.button(text="◀️ Назад", callback_data="back_to_main")
+        kb.adjust(1)
+
+        await callback.message.edit_text(text, reply_markup=kb.as_markup())
+        await callback.answer()
     async def _start_rotation_task(self, interval: int = 7200) -> None:
             """Запускает ротацию закрепленных сообщений с указанным интервалом"""
             self.state = RunningState(self, interval)
@@ -1662,16 +1931,46 @@ class BotContext:
     
     
     async def forward_and_pin_message(self, channel_id: str, message_id: int) -> bool:
-        """Пересылка и закрепление сообщений из канала во все целевые чаты"""
+        """Пересылка и закрепление сообщений из канала во все целевые чаты с улучшенной обработкой ошибок"""
         try:
             target_chats = await Repository.get_target_chats()
             if not target_chats:
-                logger.warning("Нет целевых чатов для пересылки")
+                logger.warning("⚠️ Нет целевых чатов для пересылки")
                 return False
             
             # Для отслеживания общего результата операции
             success = False
             
+            # Сначала проверяем, существует ли сообщение в канале
+            try:
+                # Пытаемся получить информацию о сообщении, пересылая себе для проверки
+                await self.bot.forward_message(
+                    chat_id=self.config.owner_id,
+                    from_chat_id=channel_id,
+                    message_id=message_id
+                )
+                logger.debug(f"✅ Сообщение {message_id} из канала {channel_id} доступно")
+            except Exception as e:
+                logger.error(f"❌ Сообщение {message_id} недоступно в канале {channel_id}: {e}")
+                
+                # Пытаемся найти более новое сообщение
+                logger.info(f"🔍 Попытка найти более новое сообщение в канале {channel_id}")
+                try:
+                    from utils.message_utils import find_latest_message
+                    latest_message_id = await find_latest_message(self.bot, channel_id, self.config.owner_id, message_id)
+                    
+                    if latest_message_id and latest_message_id != message_id:
+                        logger.info(f"📨 Найдено более новое сообщение {latest_message_id} в канале {channel_id}")
+                        await Repository.save_last_message(channel_id, latest_message_id)
+                        message_id = latest_message_id
+                    else:
+                        logger.warning(f"⚠️ Не удалось найти новые сообщения в канале {channel_id}")
+                        return False
+                except Exception as find_error:
+                    logger.error(f"❌ Ошибка при поиске новых сообщений в канале {channel_id}: {find_error}")
+                    return False
+            
+            # Пересылаем сообщение во все целевые чаты
             for chat_id in target_chats:
                 try:
                     # Получаем предыдущее закрепленное сообщение для этого чата
@@ -1684,6 +1983,7 @@ class BotContext:
                             from_chat_id=channel_id,
                             message_id=message_id
                         )
+                        logger.debug(f"📤 Сообщение переслано в чат {chat_id}")
                         
                         # Если успешно переслали, пробуем открепить предыдущее 
                         if prev_pinned:
@@ -1692,8 +1992,9 @@ class BotContext:
                                     chat_id=chat_id,
                                     message_id=prev_pinned
                                 )
+                                logger.debug(f"📌 Откреплено предыдущее сообщение {prev_pinned} в чате {chat_id}")
                             except Exception as e:
-                                logger.warning(f"Не удалось открепить предыдущее сообщение в чате {chat_id}: {e}")
+                                logger.warning(f"⚠️ Не удалось открепить предыдущее сообщение в чате {chat_id}: {e}")
                         
                         # Закрепляем новое сообщение
                         try:
@@ -1710,19 +2011,23 @@ class BotContext:
                             if hasattr(self, 'pinned_messages'):
                                 self.pinned_messages[str(chat_id)] = fwd.message_id
                             
-                            logger.info(f"Сообщение {message_id} из канала {channel_id} переслано и закреплено в чат {chat_id}")
+                            logger.info(f"📌 Сообщение {message_id} из канала {channel_id} переслано и закреплено в чат {chat_id}")
                             success = True
                         except Exception as e:
-                            logger.error(f"Не удалось закрепить сообщение в чате {chat_id}: {e}")
+                            logger.error(f"❌ Не удалось закрепить сообщение в чате {chat_id}: {e}")
+                            # Даже если не удалось закрепить, пересылка прошла успешно
+                            success = True
                     except Exception as e:
-                        logger.error(f"Не удалось переслать сообщение из канала {channel_id} в чат {chat_id}: {e}")
+                        logger.error(f"❌ Не удалось переслать сообщение из канала {channel_id} в чат {chat_id}: {e}")
                 except Exception as e:
-                    logger.error(f"Ошибка при обработке чата {chat_id}: {e}")
+                    logger.error(f"❌ Ошибка при обработке чата {chat_id}: {e}")
             
             # Возвращаем общий результат операции
             return success
         except Exception as e:
-            logger.error(f"Ошибка в forward_and_pin_message: {e}")
+            logger.error(f"❌ Критическая ошибка в forward_and_pin_message: {e}")
+            import traceback
+            logger.error(f"Traceback: {traceback.format_exc()}")
             return False
 
 
