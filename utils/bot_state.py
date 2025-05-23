@@ -1,11 +1,14 @@
+# 1. Обновленный файл utils/bot_state.py с полной реализацией BotContext
+
 from abc import ABC, abstractmethod
 from typing import Optional
 import asyncio
 from loguru import logger
 from database.repository import Repository
 from datetime import datetime, timedelta
-from aiogram import types
+from aiogram import types, Bot
 from utils.message_utils import find_latest_message as find_msg
+from utils.config import Config
 
 class BotState(ABC):
     """Abstract base class for bot states"""
@@ -267,6 +270,10 @@ class RunningState(BotState):
         logger.warning("Метод _rotate_to_next_channel не используется в режиме расписания")
         return False
 
+    async def _get_active_channel(self) -> Optional[str]:
+        """Получение текущего активного канала"""
+        info = await self._get_active_channel_info()
+        return info["channel_id"] if info else None
                 
 class BotContext:
     """Контекстный класс, управляющий состоянием бота"""
@@ -275,6 +282,8 @@ class BotContext:
         self.bot = bot
         self.config = config
         self.state: BotState = IdleState(self)
+        # Для хранения закрепленных сообщений
+        self.pinned_messages = {}
     
     async def start(self) -> None:
         await self.state.start()
@@ -283,15 +292,20 @@ class BotContext:
         await self.state.stop()
     
     async def handle_message(self, channel_id: str, message_id: int) -> None:
+        """Делегирование обработки сообщения текущему состоянию"""
         await self.state.handle_message(channel_id, message_id)
     
     async def rotate_now(self) -> bool:
-        """Немедленно выполняет ротацию на следующий канал"""
+        """Немедленно активировать текущий канал по расписанию"""
         if not isinstance(self.state, RunningState):
             logger.warning("Нельзя выполнить немедленную ротацию: бот не запущен")
             return False
-        
-        return await self.state._rotate_to_next_channel()
+        active_channel = await self.state._get_active_channel()
+        if active_channel:
+            message_id = await Repository.get_last_message(active_channel)
+            if message_id:
+                return await self.forward_and_pin_message(active_channel, message_id)
+        return False
     
     async def forward_and_pin_message(self, channel_id: str, message_id: int) -> bool:
         """Пересылка и закрепление сообщений из канала во все целевые чаты без пересылки админу для проверки"""
@@ -342,8 +356,7 @@ class BotContext:
                             await Repository.save_pinned_message(str(chat_id), fwd.message_id)
                             
                             # Если у нас есть словарь для отслеживания, обновляем его
-                            if hasattr(self, 'pinned_messages'):
-                                self.pinned_messages[str(chat_id)] = fwd.message_id
+                            self.pinned_messages[str(chat_id)] = fwd.message_id
                             
                             logger.info(f"📌 Сообщение {message_id} из канала {channel_id} переслано и закреплено в чат {chat_id}")
                             success = True
@@ -391,6 +404,46 @@ class BotContext:
             import traceback
             logger.error(f"Traceback: {traceback.format_exc()}")
             return False
+    
+    async def forward_latest_messages(self) -> bool:
+        """Пересылает последние сообщения из всех каналов"""
+        success = False
+        source_channels = self.config.source_channels
+        
+        if not source_channels:
+            logger.warning("Нет настроенных исходных каналов")
+            return False
+        
+        logger.info(f"Найдено {len(source_channels)} исходных каналов")
+        
+        # Проверяем наличие целевых чатов
+        target_chats = await Repository.get_target_chats()
+        if not target_chats:
+            logger.warning("Нет целевых чатов для пересылки. Бот должен быть добавлен в группы/супергруппы.")
+            return False
+        
+        logger.info(f"Найдено {len(target_chats)} целевых чатов")
+        
+        for channel_id in source_channels:
+            # Получаем ID последнего сообщения
+            message_id = await Repository.get_last_message(channel_id)
+            
+            if not message_id:
+                logger.warning(f"Не найдено последнее сообщение для канала {channel_id}")
+                continue
+            
+            logger.info(f"Найдено сообщение {message_id} для канала {channel_id}")
+            
+            # Пересылаем и закрепляем сообщение
+            result = await self.forward_and_pin_message(channel_id, message_id)
+            success = success or result
+            
+            if result:
+                logger.info(f"Успешно переслано сообщение {message_id} из канала {channel_id}")
+            else:
+                logger.warning(f"Не удалось переслать сообщение {message_id} из канала {channel_id}")
+        
+        return success
     
     async def _notify_admins(self, message: str):
         """Отправка уведомления всем администраторам бота"""

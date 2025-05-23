@@ -16,7 +16,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 # Импортируем наши модули
 from utils.config import Config
-from utils.bot_state import BotContext, BotState, IdleState, RunningState
+from utils.bot_state import BotContext, IdleState, RunningState
 from utils.keyboard_factory import KeyboardFactory
 from database.repository import Repository, DatabaseConnectionPool
 from services.chat_cache import ChatCacheService, CacheObserver, ChatInfo
@@ -1719,22 +1719,23 @@ class ForwarderBot(CacheObserver):
             await callback.answer("Не удалось удалить канал")
         
         await self.manage_channels(callback)
+    
 
     async def handle_channel_post(self, message: types.Message | None):
         """Обработчик сообщений в каналах - ТОЛЬКО сохранение, БЕЗ автопересылки"""
         if message is None:
             return
-            
+                
         chat_id = str(message.chat.id)
         username = getattr(message.chat, 'username', None)
         source_channels = self.config.source_channels
-            
+                
         is_source = False
         for channel in source_channels:
             if channel == chat_id or (username and channel.lower() == username.lower()):
                 is_source = True
                 break
-                
+                    
         if not is_source:
             logger.info(f"Сообщение не из канала-источника: {chat_id}/{username}")
             return
@@ -1743,10 +1744,7 @@ class ForwarderBot(CacheObserver):
         await Repository.save_last_message(chat_id, message.message_id)
         logger.info(f"💾 Сохранено сообщение {message.message_id} из канала {chat_id}")
         
-        # ВАЖНО: Убираем автоматическую пересылку
-        # Пересылка будет происходить ТОЛЬКО по расписанию через RunningState._schedule_check()
-        
-        # Вызываем handle_message для обновления состояния, но без автопересылки
+        # Делегируем обработку сообщения контексту
         await self.context.handle_message(chat_id, message.message_id)
         
         logger.info(f"ℹ️ Сообщение {message.message_id} из канала {chat_id} будет обработано только по расписанию")
@@ -1835,6 +1833,7 @@ class ForwarderBot(CacheObserver):
             # Восстанавливаем закрепленные сообщения из базы данных
             pinned_messages = await Repository.get_all_pinned_messages()
             self.pinned_messages = pinned_messages
+            self.context.pinned_messages = pinned_messages  # Передаем в контекст
             logger.info(f"Загружено {len(pinned_messages)} закрепленных сообщений")
             
             # Устанавливаем интервал по умолчанию, если не задан
@@ -1952,171 +1951,6 @@ class KeyboardFactory:
         kb.adjust(1)
         return kb.as_markup()
 
-# Обновляем класс BotContext для работы с ротацией и закреплением
-class BotContext:
-    def __init__(self, bot, config):
-        self.bot = bot
-        self.config = config
-        self.state: BotState = IdleState(self)
-    
-    async def rotate_now(self) -> bool:
-        """Немедленно активировать текущий канал по расписанию"""
-        if not isinstance(self.state, RunningState):
-            logger.warning("Нельзя выполнить немедленную ротацию: бот не запущен")
-            return False
-        active_channel = await self.state._get_active_channel()
-        if active_channel:
-            message_id = await Repository.get_last_message(active_channel)
-            if message_id:
-                return await self.forward_and_pin_message(active_channel, message_id)
-        return False
-    
-    async def start(self) -> None:
-        await self.state.start()
-    
-    async def stop(self) -> None:
-        await self.state.stop()
-    
-    
-    async def forward_and_pin_message(self, channel_id: str, message_id: int) -> bool:
-        """Пересылка и закрепление сообщений из канала во все целевые чаты без пересылки админу для проверки"""
-        try:
-            target_chats = await Repository.get_target_chats()
-            if not target_chats:
-                logger.warning("⚠️ Нет целевых чатов для пересылки")
-                return False
-            
-            # Для отслеживания общего результата операции
-            success = False
-            
-            # Пересылаем сообщение во все целевые чаты
-            for chat_id in target_chats:
-                try:
-                    # Получаем предыдущее закрепленное сообщение для этого чата
-                    prev_pinned = await Repository.get_pinned_message(str(chat_id))
-                    
-                    # Пересылаем новое сообщение
-                    try:
-                        fwd = await self.bot.forward_message(
-                            chat_id=chat_id,
-                            from_chat_id=channel_id,
-                            message_id=message_id
-                        )
-                        logger.debug(f"📤 Сообщение переслано в чат {chat_id}")
-                        
-                        # Если успешно переслали, пробуем открепить предыдущее 
-                        if prev_pinned:
-                            try:
-                                await self.bot.unpin_chat_message(
-                                    chat_id=chat_id,
-                                    message_id=prev_pinned
-                                )
-                                logger.debug(f"📌 Откреплено предыдущее сообщение {prev_pinned} в чате {chat_id}")
-                            except Exception as e:
-                                logger.warning(f"⚠️ Не удалось открепить предыдущее сообщение в чате {chat_id}: {e}")
-                        
-                        # Закрепляем новое сообщение
-                        try:
-                            await self.bot.pin_chat_message(
-                                chat_id=chat_id,
-                                message_id=fwd.message_id,
-                                disable_notification=True
-                            )
-                            
-                            # Сохраняем ID нового закрепленного сообщения
-                            await Repository.save_pinned_message(str(chat_id), fwd.message_id)
-                            
-                            # Если у нас есть словарь для отслеживания, обновляем его
-                            if hasattr(self, 'pinned_messages'):
-                                self.pinned_messages[str(chat_id)] = fwd.message_id
-                            
-                            logger.info(f"📌 Сообщение {message_id} из канала {channel_id} переслано и закреплено в чат {chat_id}")
-                            success = True
-                        except Exception as e:
-                            logger.error(f"❌ Не удалось закрепить сообщение в чате {chat_id}: {e}")
-                            # Даже если не удалось закрепить, пересылка прошла успешно
-                            success = True
-                    except Exception as e:
-                        # Если сообщение не может быть переслано (например, не существует)
-                        error_text = str(e).lower()
-                        if any(phrase in error_text for phrase in [
-                            "message not found", 
-                            "message to forward not found",
-                            "message_id_invalid"
-                        ]):
-                            logger.warning(f"⚠️ Сообщение {message_id} не найдено в канале {channel_id}")
-                            
-                            # Пытаемся найти более новое сообщение
-                            logger.info(f"🔍 Попытка найти более новое сообщение в канале {channel_id}")
-                            try:
-                                from utils.message_utils import find_latest_message
-                                latest_message_id = await find_latest_message(self.bot, channel_id, self.config.owner_id, message_id)
-                                
-                                if latest_message_id and latest_message_id != message_id:
-                                    logger.info(f"📨 Найдено более новое сообщение {latest_message_id} в канале {channel_id}")
-                                    await Repository.save_last_message(channel_id, latest_message_id)
-                                    
-                                    # Рекурсивно пробуем переслать новое сообщение
-                                    return await self.forward_and_pin_message(channel_id, latest_message_id)
-                                else:
-                                    logger.warning(f"⚠️ Не удалось найти новые сообщения в канале {channel_id}")
-                                    return False
-                            except Exception as find_error:
-                                logger.error(f"❌ Ошибка при поиске новых сообщений в канале {channel_id}: {find_error}")
-                                return False
-                        else:
-                            logger.error(f"❌ Не удалось переслать сообщение из канала {channel_id} в чат {chat_id}: {e}")
-                except Exception as e:
-                    logger.error(f"❌ Ошибка при обработке чата {chat_id}: {e}")
-            
-            # Возвращаем общий результат операции
-            return success
-        except Exception as e:
-            logger.error(f"❌ Критическая ошибка в forward_and_pin_message: {e}")
-            import traceback
-            logger.error(f"Traceback: {traceback.format_exc()}")
-            return False
-
-
-    async def forward_latest_messages(self) -> bool:
-        """Пересылает последние сообщения из всех каналов"""
-        success = False
-        source_channels = self.config.source_channels
-        
-        if not source_channels:
-            logger.warning("Нет настроенных исходных каналов")
-            return False
-        
-        logger.info(f"Найдено {len(source_channels)} исходных каналов")
-        
-        # Проверяем наличие целевых чатов
-        target_chats = await Repository.get_target_chats()
-        if not target_chats:
-            logger.warning("Нет целевых чатов для пересылки. Бот должен быть добавлен в группы/супергруппы.")
-            return False
-        
-        logger.info(f"Найдено {len(target_chats)} целевых чатов")
-        
-        for channel_id in source_channels:
-            # Получаем ID последнего сообщения
-            message_id = await Repository.get_last_message(channel_id)
-            
-            if not message_id:
-                logger.warning(f"Не найдено последнее сообщение для канала {channel_id}")
-                continue
-            
-            logger.info(f"Найдено сообщение {message_id} для канала {channel_id}")
-            
-            # Пересылаем и закрепляем сообщение
-            result = await self.forward_and_pin_message(channel_id, message_id)
-            success = success or result
-            
-            if result:
-                logger.info(f"Успешно переслано сообщение {message_id} из канала {channel_id}")
-            else:
-                logger.warning(f"Не удалось переслать сообщение {message_id} из канала {channel_id}")
-        
-        return success
             
 # Update the main function to handle cleanup
 async def main():
