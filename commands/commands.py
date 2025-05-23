@@ -7,6 +7,7 @@ from utils.keyboard_factory import KeyboardFactory
 from utils.bot_state import IdleState, RunningState
 from utils.config import Config
 
+
 class StartCommand(Command):
     def __init__(self, running: bool = False):
         super().__init__()

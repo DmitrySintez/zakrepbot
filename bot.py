@@ -27,7 +27,7 @@ from commands.commands import (
     GetLastMessageCommand,
     ForwardNowCommand,
     TestMessageCommand,
-    FindLastMessageCommand
+    FindLastMessageCommand,
 )
 from utils.message_utils import find_latest_message as find_msg
 
@@ -887,7 +887,7 @@ class ForwarderBot(CacheObserver):
                 lambda message: hasattr(self, 'awaiting_clone_token') and 
                 self.awaiting_clone_token == message.from_user.id
             )
-
+        
         self.dp.callback_query.register(self.manage_schedule, lambda c: c.data == "manage_schedule")
         self.dp.callback_query.register(self.add_schedule_prompt, lambda c: c.data == "add_schedule")
         self.dp.callback_query.register(self.remove_schedule_prompt, lambda c: c.data == "remove_schedule")
@@ -1721,7 +1721,7 @@ class ForwarderBot(CacheObserver):
         await self.manage_channels(callback)
 
     async def handle_channel_post(self, message: types.Message | None):
-        """Обработчик сообщений в каналах"""
+        """Обработчик сообщений в каналах - ТОЛЬКО сохранение, БЕЗ автопересылки"""
         if message is None:
             return
             
@@ -1739,15 +1739,17 @@ class ForwarderBot(CacheObserver):
             logger.info(f"Сообщение не из канала-источника: {chat_id}/{username}")
             return
         
-        # Сохраняем ID последнего сообщения
+        # ТОЛЬКО сохраняем ID последнего сообщения
         await Repository.save_last_message(chat_id, message.message_id)
+        logger.info(f"💾 Сохранено сообщение {message.message_id} из канала {chat_id}")
         
-        if isinstance(self.context.state, RunningState) and self.context.state.auto_forward:
-            # Перенаправляем новое сообщение и закрепляем его
-            await self.context.forward_and_pin_message(chat_id, message.message_id)
-            logger.info(f"Переслано и закреплено сообщение {message.message_id} из канала {chat_id}")
-        else:
-            logger.info(f"Сохранено сообщение {message.message_id} из канала {chat_id} (без автопересылки)")
+        # ВАЖНО: Убираем автоматическую пересылку
+        # Пересылка будет происходить ТОЛЬКО по расписанию через RunningState._schedule_check()
+        
+        # Вызываем handle_message для обновления состояния, но без автопересылки
+        await self.context.handle_message(chat_id, message.message_id)
+        
+        logger.info(f"ℹ️ Сообщение {message.message_id} из канала {chat_id} будет обработано только по расписанию")
 
     async def handle_chat_member(self, update: types.ChatMemberUpdated):
         """Обработчик добавления/удаления бота из чатов"""

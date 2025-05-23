@@ -45,19 +45,20 @@ class IdleState:
         pass
     
     async def handle_message(self, channel_id: str, message_id: int) -> None:
+        """В режиме ожидания только сохраняем сообщения, НЕ пересылаем"""
         await Repository.save_last_message(channel_id, message_id)
-        logger.info(f"Сохранено сообщение {message_id} из канала {channel_id} (бот остановлен)")
+        logger.info(f"💾 Сохранено сообщение {message_id} из канала {channel_id} (бот остановлен, пересылка отключена)")
 
 class RunningState(BotState):
-    """Состояние, когда бот активно закрепляет сообщения по расписанию"""
+    """Состояние, когда бот активно закрепляет сообщения ТОЛЬКО по расписанию"""
     
-    def __init__(self, bot_context, auto_forward: bool = True):
+    def __init__(self, bot_context, auto_forward: bool = False):  # Изменено на False
         self.context = bot_context
         self._schedule_task = None
         self._current_active_channel = None  # Текущий активный канал
         self._current_pinned_message = None  # ID текущего закрепленного сообщения
         self._last_pin_time = None  # Время последнего закрепления
-        self.auto_forward = auto_forward
+        self.auto_forward = auto_forward  # ОТКЛЮЧЕНА автопересылка
         self._last_check_date = None
         self._processed_slots = set()  # Отслеживание обработанных слотов в текущий день
         self._start_schedule_task()
@@ -70,7 +71,7 @@ class RunningState(BotState):
     async def _schedule_check(self):
         """Периодическая проверка расписания с логикой смены дня"""
         try:
-            logger.info("🕐 Запущена задача проверки расписания")
+            logger.info("🕐 Запущена задача проверки расписания (ТОЛЬКО по времени, без автопересылки)")
             while True:
                 current_date = datetime.now().date()
                 current_time = datetime.now().strftime("%H:%M")
@@ -101,7 +102,7 @@ class RunningState(BotState):
                         latest_message_id = await Repository.get_last_message(channel_id)
                         
                         if latest_message_id:
-                            # Пытаемся переслать и закрепить сообщение
+                            # Пытаемся переслать и закрепить сообщение ТОЛЬКО по расписанию
                             success = await self.context.forward_and_pin_message(channel_id, latest_message_id)
                             
                             if success:
@@ -110,7 +111,7 @@ class RunningState(BotState):
                                 self._last_pin_time = datetime.now()
                                 self._processed_slots.add(slot_id)  # Отмечаем слот как обработанный
                                 
-                                logger.info(f"✅ Успешно обработан слот {slot_id} для канала {channel_id}")
+                                logger.info(f"✅ Успешно обработан слот {slot_id} для канала {channel_id} (по расписанию)")
                             else:
                                 logger.error(f"❌ Не удалось обработать слот {slot_id} для канала {channel_id}")
                         else:
@@ -247,38 +248,14 @@ class RunningState(BotState):
         self.context.state = IdleState(self.context)
     
     async def handle_message(self, channel_id: str, message_id: int) -> None:
-        """Обработка нового сообщения из канала"""
+        """Обработка нового сообщения из канала - ТОЛЬКО сохранение, БЕЗ автопересылки"""
         await Repository.save_last_message(channel_id, message_id)
-        logger.info(f"💾 Сохранено новое сообщение {message_id} из канала {channel_id}")
+        logger.info(f"💾 Сохранено новое сообщение {message_id} из канала {channel_id} (автопересылка ОТКЛЮЧЕНА)")
         
-        # Проверяем, активен ли этот канал сейчас
-        active_channel_info = await self._get_active_channel_info()
-        if active_channel_info and active_channel_info["channel_id"] == channel_id:
-            # Если канал активен, но слот уже был обработан, обновляем сообщение
-            slot_id = active_channel_info["slot_id"]
-            
-            if slot_id in self._processed_slots:
-                logger.info(f"🔄 Обновление сообщения в активном слоте {slot_id}")
-                
-                success = await self.context.forward_and_pin_message(channel_id, message_id)
-                if success:
-                    self._current_pinned_message = message_id
-                    logger.info(f"📌 Обновлено закрепленное сообщение {message_id} из активного канала {channel_id}")
-                else:
-                    logger.warning(f"⚠️ Не удалось обновить сообщение {message_id} из канала {channel_id}")
-            else:
-                # Если слот еще не был обработан, отмечаем его как обработанный
-                success = await self.context.forward_and_pin_message(channel_id, message_id)
-                if success:
-                    self._current_active_channel = channel_id
-                    self._current_pinned_message = message_id
-                    self._last_pin_time = datetime.now()
-                    self._processed_slots.add(slot_id)
-                    logger.info(f"📌 Новое сообщение {message_id} из активного канала {channel_id} переслано и закреплено")
-                else:
-                    logger.warning(f"⚠️ Не удалось переслать новое сообщение {message_id} из канала {channel_id}")
-        else:
-            logger.info(f"ℹ️ Канал {channel_id} не активен по расписанию, сообщение только сохранено")
+        # ВАЖНО: НЕ пересылаем сообщения автоматически при их появлении
+        # Пересылка происходит ТОЛЬКО по расписанию через _schedule_check()
+        
+        logger.info(f"ℹ️ Сообщение {message_id} из канала {channel_id} будет переслано только по расписанию")
     
     async def find_latest_message(self, channel_id: str) -> Optional[int]:
         """Поиск последнего доступного сообщения в канале"""
