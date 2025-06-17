@@ -376,12 +376,15 @@ class ForwarderBot(CacheObserver):
                 elif os.path.isfile(src):
                     shutil.copy2(src, dst)
             
-            # Create new .env file with new token
+            # Create new .env file with new token - ИСПРАВЛЕНО
             env_content = f"""# Telegram Bot Token from @BotFather
     BOT_TOKEN={new_token}
 
     # Your Telegram user ID (get from @userinfobot)
     OWNER_ID={self.config.owner_id}
+
+    # Admin IDs (comma separated for multiple admins)
+    ADMIN_IDS={','.join(map(str, self.config.admin_ids))}
 
     # Source channel username or ID (bot must be admin)
     # Can be either numeric ID (-100...) or channel username without @
@@ -421,7 +424,7 @@ class ForwarderBot(CacheObserver):
             with open(os.path.join(clone_path, 'start_bot.bat'), 'w') as f:
                 f.write(start_script_windows)
             
-            # Create README.md for the clone
+            # Create README.md for the clone - ИСПРАВЛЕНО
             readme_content = f"""# Bot Clone: @{bot_info.username}
 
     This is a clone of the main forwarding bot.
@@ -429,6 +432,7 @@ class ForwarderBot(CacheObserver):
     ## Configuration
     - Bot Token: Configured in .env
     - Owner ID: {self.config.owner_id}
+    - Admin IDs: {', '.join(map(str, self.config.admin_ids))}
     - Source Channels: {', '.join(self.config.source_channels)}
 
     ## Running the bot
@@ -452,6 +456,7 @@ class ForwarderBot(CacheObserver):
     - Make sure the bot is admin in all source channels
     - The bot will forward messages to the same target chats as the main bot
     - Database is separate from the main bot
+    - All configured admins can manage this bot clone
     """
             
             with open(os.path.join(clone_path, 'README.md'), 'w') as f:
@@ -468,7 +473,7 @@ class ForwarderBot(CacheObserver):
                     f"Для запуска клона:\n"
                     f"1. Перейдите в папку: {clone_path}\n"
                     f"2. Запустите: `python bot.py` или используйте скрипт start_bot.sh (Linux) / start_bot.bat (Windows)\n\n"
-                    f"Клон будет работать независимо с теми же настройками каналов."
+                    f"Клон будет работать независимо с теми же настройками каналов и администраторами."
                 )
                 
                 await progress_msg.edit_text(success_text, reply_markup=kb.as_markup())
@@ -487,11 +492,10 @@ class ForwarderBot(CacheObserver):
                 )
             raise
 
-
-
     async def create_clone_files(self, callback: types.CallbackQuery):
         """Create clone files for separate deployment"""
-        if callback.from_user.id != self.config.owner_id:
+        # БЫЛО: if callback.from_user.id != self.config.owner_id:
+        if not self.is_admin(callback.from_user.id):  # ИСПРАВЛЕНО
             return
         
         # Parse data: clone_files_token
@@ -545,9 +549,11 @@ class ForwarderBot(CacheObserver):
             logger.error(f"Failed to create clone files: {e}")
         
         await callback.answer()
+
     async def clone_bot_inline(self, callback: types.CallbackQuery):
         """Run cloned bot in the same solution"""
-        if callback.from_user.id != self.config.owner_id:
+        # БЫЛО: if callback.from_user.id != self.config.owner_id:
+        if not self.is_admin(callback.from_user.id):  # ИСПРАВЛЕНО
             return
         
         # Parse data: clone_inline_token
@@ -628,7 +634,8 @@ class ForwarderBot(CacheObserver):
         await callback.answer()
     async def manage_clones(self, callback: types.CallbackQuery):
         """Manage running bot clones"""
-        if callback.from_user.id != self.config.owner_id:
+        # БЫЛО: if callback.from_user.id != self.config.owner_id:
+        if not self.is_admin(callback.from_user.id):  # ИСПРАВЛЕНО
             return
         
         # Ensure bot_manager exists
@@ -690,7 +697,8 @@ class ForwarderBot(CacheObserver):
 
     async def stop_clone(self, callback: types.CallbackQuery):
         """Stop a running bot clone"""
-        if callback.from_user.id != self.config.owner_id:
+        # БЫЛО: if callback.from_user.id != self.config.owner_id:
+        if not self.is_admin(callback.from_user.id):  # ИСПРАВЛЕНО
             return
         
         bot_id = callback.data.replace("stop_clone_", "")
@@ -710,7 +718,8 @@ class ForwarderBot(CacheObserver):
     # Update the clone_bot_submit method to provide inline option
     async def clone_bot_submit(self, message: types.Message):
         """Handler for new bot token submission"""
-        if message.from_user.id != self.config.owner_id:
+        # БЫЛО: if message.from_user.id != self.config.owner_id:
+        if not self.is_admin(message.from_user.id):  # ИСПРАВЛЕНО
             return
         
         if not hasattr(self, 'awaiting_clone_token') or self.awaiting_clone_token != message.from_user.id:
@@ -758,8 +767,9 @@ class ForwarderBot(CacheObserver):
 
     async def clone_bot_prompt(self, callback: types.CallbackQuery):
         """Prompt for cloning the bot"""
-        if callback.from_user.id != self.config.owner_id:
+        if not self.is_admin(callback.from_user.id):
             return
+        
         
         # Set state to wait for new token
         self.awaiting_clone_token = callback.from_user.id
@@ -783,7 +793,7 @@ class ForwarderBot(CacheObserver):
     # Let's also add the overwrite_clone method that was referenced earlier
     async def overwrite_clone(self, callback: types.CallbackQuery):
         """Handler for overwriting existing clone"""
-        if callback.from_user.id != self.config.owner_id:
+        if not self.is_admin(callback.from_user.id):  # ИСПРАВЛЕНО
             return
         
         # Parse data: overwrite_clone_dirname_token
